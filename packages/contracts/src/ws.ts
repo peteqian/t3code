@@ -38,6 +38,7 @@ import { KeybindingRule } from "./keybindings";
 import { ProjectSearchEntriesInput, ProjectWriteFileInput } from "./project";
 import { OpenInEditorInput } from "./editor";
 import { ServerConfigUpdatedPayload } from "./server";
+import { MobilePairingCreateRequest, MobileRevokeDeviceRequest } from "./mobileCompanion";
 
 // ── WebSocket RPC Method Names ───────────────────────────────────────
 
@@ -76,6 +77,9 @@ export const WS_METHODS = {
   // Server meta
   serverGetConfig: "server.getConfig",
   serverUpsertKeybinding: "server.upsertKeybinding",
+  serverCreateMobilePairing: "server.createMobilePairing",
+  serverListMobileDevices: "server.listMobileDevices",
+  serverRevokeMobileDevice: "server.revokeMobileDevice",
 } as const;
 
 // ── Push Event Channels ──────────────────────────────────────────────
@@ -85,6 +89,7 @@ export const WS_CHANNELS = {
   terminalEvent: "terminal.event",
   serverWelcome: "server.welcome",
   serverConfigUpdated: "server.configUpdated",
+  serverMobilePresence: "server.mobilePresence",
 } as const;
 
 // -- Tagged Union of all request body schemas ─────────────────────────
@@ -141,6 +146,9 @@ const WebSocketRequestBody = Schema.Union([
   // Server meta
   tagRequestBody(WS_METHODS.serverGetConfig, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverUpsertKeybinding, KeybindingRule),
+  tagRequestBody(WS_METHODS.serverCreateMobilePairing, MobilePairingCreateRequest),
+  tagRequestBody(WS_METHODS.serverListMobileDevices, Schema.Struct({})),
+  tagRequestBody(WS_METHODS.serverRevokeMobileDevice, MobileRevokeDeviceRequest),
 ]);
 
 export const WebSocketRequest = Schema.Struct({
@@ -166,14 +174,25 @@ export type WsPushSequence = typeof WsPushSequence.Type;
 export const WsWelcomePayload = Schema.Struct({
   cwd: TrimmedNonEmptyString,
   projectName: TrimmedNonEmptyString,
+  connectionKind: Schema.optional(Schema.Literals(["desktop", "mobile", "anonymous"])),
+  connectionDeviceId: Schema.optional(TrimmedNonEmptyString),
+  connectionDeviceName: Schema.optional(TrimmedNonEmptyString),
   bootstrapProjectId: Schema.optional(ProjectId),
   bootstrapThreadId: Schema.optional(ThreadId),
 });
 export type WsWelcomePayload = typeof WsWelcomePayload.Type;
 
+export const WsMobilePresencePayload = Schema.Struct({
+  mobileConnectionCount: NonNegativeInt,
+  deviceIds: Schema.Array(TrimmedNonEmptyString),
+  deviceNames: Schema.Array(TrimmedNonEmptyString),
+});
+export type WsMobilePresencePayload = typeof WsMobilePresencePayload.Type;
+
 export interface WsPushPayloadByChannel {
   readonly [WS_CHANNELS.serverWelcome]: WsWelcomePayload;
   readonly [WS_CHANNELS.serverConfigUpdated]: typeof ServerConfigUpdatedPayload.Type;
+  readonly [WS_CHANNELS.serverMobilePresence]: WsMobilePresencePayload;
   readonly [WS_CHANNELS.gitActionProgress]: typeof GitActionProgressEvent.Type;
   readonly [WS_CHANNELS.terminalEvent]: typeof TerminalEvent.Type;
   readonly [ORCHESTRATION_WS_CHANNELS.domainEvent]: OrchestrationEvent;
@@ -194,6 +213,10 @@ const makeWsPushSchema = <const Channel extends string, Payload extends Schema.S
   });
 
 export const WsPushServerWelcome = makeWsPushSchema(WS_CHANNELS.serverWelcome, WsWelcomePayload);
+export const WsPushServerMobilePresence = makeWsPushSchema(
+  WS_CHANNELS.serverMobilePresence,
+  WsMobilePresencePayload,
+);
 export const WsPushServerConfigUpdated = makeWsPushSchema(
   WS_CHANNELS.serverConfigUpdated,
   ServerConfigUpdatedPayload,
@@ -211,6 +234,7 @@ export const WsPushOrchestrationDomainEvent = makeWsPushSchema(
 export const WsPushChannelSchema = Schema.Literals([
   WS_CHANNELS.gitActionProgress,
   WS_CHANNELS.serverWelcome,
+  WS_CHANNELS.serverMobilePresence,
   WS_CHANNELS.serverConfigUpdated,
   WS_CHANNELS.terminalEvent,
   ORCHESTRATION_WS_CHANNELS.domainEvent,
@@ -219,6 +243,7 @@ export type WsPushChannelSchema = typeof WsPushChannelSchema.Type;
 
 export const WsPush = Schema.Union([
   WsPushServerWelcome,
+  WsPushServerMobilePresence,
   WsPushServerConfigUpdated,
   WsPushGitActionProgress,
   WsPushTerminalEvent,

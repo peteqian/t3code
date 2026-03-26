@@ -47,6 +47,12 @@ import type {
   OrchestrationReadModel,
 } from "./orchestration";
 import { EditorId } from "./editor";
+import type { MobilePairingCreateRequest, MobilePairingCreateResponse } from "./mobileCompanion";
+import type {
+  MobileListDevicesResponse,
+  MobileRevokeDeviceRequest,
+  MobileRevokeDeviceResponse,
+} from "./mobileCompanion";
 
 export interface ContextMenuItem<T extends string = string> {
   id: T;
@@ -161,6 +167,11 @@ export interface NativeApi {
   server: {
     getConfig: () => Promise<ServerConfig>;
     upsertKeybinding: (input: ServerUpsertKeybindingInput) => Promise<ServerUpsertKeybindingResult>;
+    createMobilePairing: (
+      input: MobilePairingCreateRequest,
+    ) => Promise<MobilePairingCreateResponse>;
+    listMobileDevices: () => Promise<MobileListDevicesResponse>;
+    revokeMobileDevice: (input: MobileRevokeDeviceRequest) => Promise<MobileRevokeDeviceResponse>;
   };
   orchestration: {
     getSnapshot: () => Promise<OrchestrationReadModel>;

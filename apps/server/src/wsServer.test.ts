@@ -53,6 +53,7 @@ import { GitCore } from "./git/Services/GitCore.ts";
 import { GitCommandError, GitManagerError } from "./git/Errors.ts";
 import { MigrationError } from "@effect/sql-sqlite-bun/SqliteMigrator";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService.ts";
+import { MobileSessionManagerLive } from "./mobile/Layers/MobileSessionManager";
 
 const asEventId = (value: string): EventId => EventId.makeUnsafe(value);
 const asProviderItemId = (value: string): ProviderItemId => ProviderItemId.makeUnsafe(value);
@@ -379,6 +380,28 @@ async function waitForPush<C extends WsPushChannel>(
   throw new Error(`Timed out waiting for push on ${channel}`);
 }
 
+async function waitForSocketClose(ws: WebSocket, timeoutMs = 5_000): Promise<void> {
+  if (ws.readyState === WebSocket.CLOSED) {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`Timed out waiting for socket close after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    ws.once("close", () => {
+      clearTimeout(timeoutId);
+      resolve();
+    });
+
+    ws.once("error", (error) => {
+      clearTimeout(timeoutId);
+      reject(error instanceof Error ? error : new Error("WebSocket error before close"));
+    });
+  });
+}
+
 async function rewriteKeybindingsAndWaitForPush(
   ws: WebSocket,
   keybindingsPath: string,
@@ -424,6 +447,47 @@ async function requestPath(
       },
     );
     req.once("error", reject);
+    req.end();
+  });
+}
+
+async function postJson(
+  port: number,
+  requestPath: string,
+  body: unknown,
+  options?: { readonly bearerToken?: string },
+): Promise<{ statusCode: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = Http.request(
+      {
+        hostname: "127.0.0.1",
+        port,
+        path: requestPath,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(Buffer.byteLength(payload)),
+          ...(options?.bearerToken
+            ? { Authorization: `Bearer ${options.bearerToken}` }
+            : undefined),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        res.on("end", () => {
+          resolve({
+            statusCode: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+    req.once("error", reject);
+    req.write(payload);
     req.end();
   });
 }
@@ -545,6 +609,7 @@ describe("WebSocket Server", () => {
       Layer.provideMerge(runtimeLayer),
       Layer.provideMerge(providerHealthLayer),
       Layer.provideMerge(openLayer),
+      Layer.provideMerge(MobileSessionManagerLive),
       Layer.provideMerge(serverConfigLayer),
       Layer.provideMerge(AnalyticsService.layerTest),
       Layer.provideMerge(NodeServices.layer),
@@ -598,6 +663,7 @@ describe("WebSocket Server", () => {
     expect(welcome.data).toEqual({
       cwd: "/test/project",
       projectName: "project",
+      connectionKind: "anonymous",
     });
   });
 
@@ -1944,7 +2010,264 @@ describe("WebSocket Server", () => {
 
     await expect(connectWs(port)).rejects.toThrow("WebSocket connection failed");
 
-    const [authorizedWs] = await connectAndAwaitWelcome(port, "secret-token");
+    const [authorizedWs, welcome] = await connectAndAwaitWelcome(port, "secret-token");
     connections.push(authorizedWs);
+    expect(welcome.data).toEqual(
+      expect.objectContaining({
+        connectionKind: "desktop",
+      }),
+    );
+  });
+
+  it("creates pairing codes only with desktop auth token when enabled", async () => {
+    server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const unauthorized = await postJson(port, "/api/mobile/pairing/create", {});
+    expect(unauthorized.statusCode).toBe(401);
+
+    const authorized = await postJson(
+      port,
+      "/api/mobile/pairing/create",
+      { ttlSeconds: 120 },
+      { bearerToken: "desktop-secret" },
+    );
+    expect(authorized.statusCode).toBe(200);
+    const payload = JSON.parse(authorized.body) as {
+      pairingCode: string;
+      expiresAt: string;
+    };
+    expect(typeof payload.pairingCode).toBe("string");
+    expect(payload.pairingCode).toMatch(/^[A-HJ-NP-Z2-9]{8}$/);
+    expect(typeof payload.expiresAt).toBe("string");
+  });
+
+  it("creates pairing codes through authenticated websocket server method", async () => {
+    server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const [authorizedWs] = await connectAndAwaitWelcome(port, "desktop-secret");
+    connections.push(authorizedWs);
+
+    const response = await sendRequest(authorizedWs, WS_METHODS.serverCreateMobilePairing, {
+      ttlSeconds: 120,
+    });
+    expect(response.error).toBeUndefined();
+    expect(response.result).toEqual(
+      expect.objectContaining({
+        pairingCode: expect.any(String),
+        expiresAt: expect.any(String),
+      }),
+    );
+  });
+
+  it("lists and revokes paired mobile devices through websocket server methods", async () => {
+    server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const [desktopWs] = await connectAndAwaitWelcome(port, "desktop-secret");
+    connections.push(desktopWs);
+
+    const createResponse = await postJson(
+      port,
+      "/api/mobile/pairing/create",
+      {},
+      { bearerToken: "desktop-secret" },
+    );
+    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
+
+    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
+      pairingCode: createPayload.pairingCode,
+      deviceName: "ios-simulator",
+    });
+    const exchangePayload = JSON.parse(exchangeResponse.body) as {
+      deviceId: string;
+      accessToken: string;
+    };
+
+    const [mobileWs] = await connectAndAwaitWelcome(port, exchangePayload.accessToken);
+    connections.push(mobileWs);
+
+    const listed = await sendRequest(desktopWs, WS_METHODS.serverListMobileDevices, {});
+    expect(listed.error).toBeUndefined();
+    expect(listed.result).toEqual({
+      devices: [
+        expect.objectContaining({
+          deviceId: exchangePayload.deviceId,
+          deviceName: "ios-simulator",
+        }),
+      ],
+    });
+
+    const revoked = await sendRequest(desktopWs, WS_METHODS.serverRevokeMobileDevice, {
+      deviceId: exchangePayload.deviceId,
+    });
+    expect(revoked.error).toBeUndefined();
+    expect(revoked.result).toEqual({ revoked: true });
+
+    await waitForSocketClose(mobileWs);
+
+    const noMobilesPresence = await waitForPush(
+      desktopWs,
+      WS_CHANNELS.serverMobilePresence,
+      (push) => push.data.mobileConnectionCount === 0,
+    );
+    expect(noMobilesPresence.data).toEqual({
+      mobileConnectionCount: 0,
+      deviceIds: [],
+      deviceNames: [],
+    });
+
+    const listedAfter = await sendRequest(desktopWs, WS_METHODS.serverListMobileDevices, {});
+    expect(listedAfter.error).toBeUndefined();
+    expect(listedAfter.result).toEqual({ devices: [] });
+  });
+
+  it("exchanges pairing code for tokens and allows websocket auth", async () => {
+    server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const createResponse = await postJson(
+      port,
+      "/api/mobile/pairing/create",
+      {},
+      { bearerToken: "desktop-secret" },
+    );
+    expect(createResponse.statusCode).toBe(200);
+    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
+
+    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
+      pairingCode: createPayload.pairingCode,
+      deviceName: "ios-simulator",
+    });
+    expect(exchangeResponse.statusCode).toBe(200);
+    const exchangePayload = JSON.parse(exchangeResponse.body) as {
+      accessToken: string;
+      refreshToken: string;
+      deviceId: string;
+    };
+    expect(typeof exchangePayload.deviceId).toBe("string");
+    expect(typeof exchangePayload.accessToken).toBe("string");
+    expect(typeof exchangePayload.refreshToken).toBe("string");
+
+    const [mobileWs, mobileWelcome] = await connectAndAwaitWelcome(
+      port,
+      exchangePayload.accessToken,
+    );
+    connections.push(mobileWs);
+    expect(mobileWelcome.data).toEqual(
+      expect.objectContaining({
+        connectionKind: "mobile",
+        connectionDeviceId: exchangePayload.deviceId,
+        connectionDeviceName: "ios-simulator",
+      }),
+    );
+
+    const secondExchange = await postJson(port, "/api/mobile/pairing/exchange", {
+      pairingCode: createPayload.pairingCode,
+      deviceName: "ios-simulator",
+    });
+    expect(secondExchange.statusCode).toBe(401);
+  });
+
+  it("publishes mobile presence updates when mobile clients connect", async () => {
+    server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const [desktopWs] = await connectAndAwaitWelcome(port, "desktop-secret");
+    connections.push(desktopWs);
+
+    const createResponse = await postJson(
+      port,
+      "/api/mobile/pairing/create",
+      {},
+      { bearerToken: "desktop-secret" },
+    );
+    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
+    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
+      pairingCode: createPayload.pairingCode,
+      deviceName: "ios-simulator",
+    });
+    const exchangePayload = JSON.parse(exchangeResponse.body) as {
+      accessToken: string;
+      deviceId: string;
+    };
+
+    const [mobileWs] = await connectAndAwaitWelcome(port, exchangePayload.accessToken);
+    connections.push(mobileWs);
+
+    const mobilePresence = await waitForPush(
+      desktopWs,
+      WS_CHANNELS.serverMobilePresence,
+      (push) => push.data.mobileConnectionCount === 1,
+    );
+    expect(mobilePresence.data).toEqual({
+      mobileConnectionCount: 1,
+      deviceIds: [exchangePayload.deviceId],
+      deviceNames: ["ios-simulator"],
+    });
+  });
+
+  it("rotates refresh token and invalidates old refresh credentials", async () => {
+    server = await createTestServer({ cwd: "/test" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const createResponse = await postJson(port, "/api/mobile/pairing/create", {});
+    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
+    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
+      pairingCode: createPayload.pairingCode,
+      deviceName: "ios-simulator",
+    });
+    const exchangePayload = JSON.parse(exchangeResponse.body) as { refreshToken: string };
+
+    const firstRefresh = await postJson(port, "/api/mobile/token/refresh", {
+      refreshToken: exchangePayload.refreshToken,
+    });
+    expect(firstRefresh.statusCode).toBe(200);
+    const firstRefreshPayload = JSON.parse(firstRefresh.body) as {
+      refreshToken: string;
+      accessToken: string;
+    };
+    expect(firstRefreshPayload.refreshToken).not.toBe(exchangePayload.refreshToken);
+    expect(typeof firstRefreshPayload.accessToken).toBe("string");
+
+    const staleRefresh = await postJson(port, "/api/mobile/token/refresh", {
+      refreshToken: exchangePayload.refreshToken,
+    });
+    expect(staleRefresh.statusCode).toBe(401);
+  });
+
+  it("persists paired-device refresh credentials across server restarts", async () => {
+    const baseDir = makeTempDir("t3code-mobile-session-persist-");
+
+    server = await createTestServer({ cwd: "/test", baseDir });
+    let addr = server.address();
+    let port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const createResponse = await postJson(port, "/api/mobile/pairing/create", {});
+    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
+    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
+      pairingCode: createPayload.pairingCode,
+      deviceName: "ios-simulator",
+    });
+    const exchangePayload = JSON.parse(exchangeResponse.body) as { refreshToken: string };
+
+    await closeTestServer();
+    server = await createTestServer({ cwd: "/test", baseDir });
+    addr = server.address();
+    port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const refreshResponse = await postJson(port, "/api/mobile/token/refresh", {
+      refreshToken: exchangePayload.refreshToken,
+    });
+    expect(refreshResponse.statusCode).toBe(200);
+    const refreshPayload = JSON.parse(refreshResponse.body) as { accessToken: string };
+    expect(typeof refreshPayload.accessToken).toBe("string");
   });
 });

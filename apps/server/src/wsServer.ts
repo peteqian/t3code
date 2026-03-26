@@ -78,6 +78,7 @@ import { expandHomePath } from "./os-jank.ts";
 import { makeServerPushBus } from "./wsServer/pushBus.ts";
 import { makeServerReadiness } from "./wsServer/readiness.ts";
 import { decodeJsonResult, formatSchemaError } from "@t3tools/shared/schemaJson";
+import { MobileSessionManager } from "./mobile/Services/MobileSessionManager";
 
 /**
  * ServerShape - Service API for server lifecycle control.
@@ -119,6 +120,58 @@ function rejectUpgrade(socket: Duplex, statusCode: number, message: string): voi
       "\r\n" +
       message,
   );
+}
+
+/**
+ * Reads and bounds an incoming HTTP request body.
+ */
+function readRequestBody(request: http.IncomingMessage, maxBytes = 32_768): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+
+    request.on("data", (chunk) => {
+      const bufferChunk = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += bufferChunk.byteLength;
+      if (totalBytes > maxBytes) {
+        reject(new Error("Request body too large"));
+        request.destroy();
+        return;
+      }
+      chunks.push(bufferChunk);
+    });
+
+    request.on("end", () => {
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    request.on("error", reject);
+  });
+}
+
+/**
+ * Extracts a bearer token from an Authorization header.
+ */
+function readBearerToken(request: http.IncomingMessage): string | null {
+  const authorization = request.headers.authorization;
+  if (!authorization || !authorization.startsWith("Bearer ")) {
+    return null;
+  }
+  return authorization.slice("Bearer ".length).trim() || null;
+}
+
+/**
+ * Parses a JSON request body into an object.
+ */
+function parseJsonObject(bodyText: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(bodyText);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 function websocketRawToString(raw: unknown): string | null {
@@ -202,6 +255,17 @@ function stripRequestTag<T extends { _tag: string }>(body: T) {
 const encodeWsResponse = Schema.encodeEffect(Schema.fromJsonString(WsResponse));
 const decodeWebSocketRequest = decodeJsonResult(WebSocketRequest);
 
+const MOBILE_PAIRING_CREATE_ROUTE = "/api/mobile/pairing/create";
+const MOBILE_PAIRING_EXCHANGE_ROUTE = "/api/mobile/pairing/exchange";
+const MOBILE_TOKEN_REFRESH_ROUTE = "/api/mobile/token/refresh";
+const CONNECTION_CONTEXT_SYMBOL = Symbol("t3.connection-context");
+
+interface ConnectionContext {
+  readonly connectionKind: "desktop" | "mobile" | "anonymous";
+  readonly connectionDeviceId?: string;
+  readonly connectionDeviceName?: string;
+}
+
 export type ServerCoreRuntimeServices =
   | OrchestrationEngineService
   | ProjectionSnapshotQuery
@@ -217,7 +281,8 @@ export type ServerRuntimeServices =
   | TerminalManager
   | Keybindings
   | Open
-  | AnalyticsService;
+  | AnalyticsService
+  | MobileSessionManager;
 
 export class ServerLifecycleError extends Schema.TaggedErrorClass<ServerLifecycleError>()(
   "ServerLifecycleError",
@@ -254,6 +319,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const terminalManager = yield* TerminalManager;
   const keybindingsManager = yield* Keybindings;
   const providerHealth = yield* ProviderHealth;
+  const mobileSessionManager = yield* MobileSessionManager;
   const git = yield* GitCore;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -271,6 +337,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const providerStatuses = yield* providerHealth.getStatuses;
 
   const clients = yield* Ref.make(new Set<WebSocket>());
+  const clientContexts = yield* Ref.make(new Map<WebSocket, ConnectionContext>());
   const logger = createLogger("ws");
   const readiness = yield* makeServerReadiness;
 
@@ -289,6 +356,33 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     logOutgoingPush,
   });
   yield* readiness.markPushBusReady;
+
+  const publishMobilePresence = Effect.gen(function* () {
+    const contexts = yield* Ref.get(clientContexts);
+    const mobileConnections = Array.from(contexts.values()).filter(
+      (context) => context.connectionKind === "mobile",
+    );
+    const deviceIds = Array.from(
+      new Set(
+        mobileConnections
+          .map((context) => context.connectionDeviceId)
+          .filter((value): value is string => Boolean(value && value.length > 0)),
+      ),
+    ).toSorted((left, right) => left.localeCompare(right));
+    const deviceNames = Array.from(
+      new Set(
+        mobileConnections
+          .map((context) => context.connectionDeviceName?.trim())
+          .filter((value): value is string => Boolean(value && value.length > 0)),
+      ),
+    ).toSorted((left, right) => left.localeCompare(right));
+
+    return yield* pushBus.publishAll(WS_CHANNELS.serverMobilePresence, {
+      mobileConnectionCount: mobileConnections.length,
+      deviceIds,
+      deviceNames,
+    });
+  });
   yield* keybindingsManager.start.pipe(
     Effect.mapError(
       (cause) => new ServerLifecycleError({ operation: "keybindingsRuntimeStart", cause }),
@@ -425,6 +519,130 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
       Effect.gen(function* () {
         const url = new URL(req.url ?? "/", `http://localhost:${port}`);
         if (tryHandleProjectFaviconRequest(url, res)) {
+          return;
+        }
+
+        if (url.pathname === MOBILE_PAIRING_CREATE_ROUTE && req.method === "POST") {
+          if (authToken) {
+            const bearerToken = readBearerToken(req);
+            if (bearerToken !== authToken) {
+              respond(401, { "Content-Type": "text/plain" }, "Unauthorized");
+              return;
+            }
+          }
+
+          const bodyText = yield* Effect.promise(() => readRequestBody(req)).pipe(
+            Effect.mapError(
+              () => new RouteRequestError({ message: "Failed to read request body." }),
+            ),
+          );
+          const requestBody = parseJsonObject(bodyText);
+          if (!requestBody) {
+            respond(
+              400,
+              { "Content-Type": "application/json" },
+              JSON.stringify({ error: "Expected a JSON object body." }),
+            );
+            return;
+          }
+
+          const ttlSecondsValue = requestBody.ttlSeconds;
+          const ttlSeconds =
+            typeof ttlSecondsValue === "number" && Number.isInteger(ttlSecondsValue)
+              ? ttlSecondsValue
+              : undefined;
+          if (
+            ttlSecondsValue !== undefined &&
+            (ttlSeconds === undefined || ttlSeconds < 30 || ttlSeconds > 300)
+          ) {
+            respond(
+              400,
+              { "Content-Type": "application/json" },
+              JSON.stringify({ error: "ttlSeconds must be an integer between 30 and 300." }),
+            );
+            return;
+          }
+
+          const result = yield* mobileSessionManager.createPairingSecret(
+            ttlSeconds === undefined ? undefined : { ttlSeconds },
+          );
+          respond(200, { "Content-Type": "application/json" }, JSON.stringify(result));
+          return;
+        }
+
+        if (url.pathname === MOBILE_PAIRING_EXCHANGE_ROUTE && req.method === "POST") {
+          const bodyText = yield* Effect.promise(() => readRequestBody(req)).pipe(
+            Effect.mapError(
+              () => new RouteRequestError({ message: "Failed to read request body." }),
+            ),
+          );
+          const requestBody = parseJsonObject(bodyText);
+          const pairingCode =
+            typeof requestBody?.pairingCode === "string" ? requestBody.pairingCode.trim() : "";
+          const deviceName =
+            typeof requestBody?.deviceName === "string" ? requestBody.deviceName.trim() : "";
+          if (!pairingCode || !deviceName) {
+            respond(
+              400,
+              { "Content-Type": "application/json" },
+              JSON.stringify({ error: "pairingCode and deviceName are required." }),
+            );
+            return;
+          }
+
+          const exchangeResult = yield* mobileSessionManager
+            .exchangePairingSecret({ pairingCode, deviceName })
+            .pipe(Effect.exit);
+
+          if (Exit.isFailure(exchangeResult)) {
+            respond(
+              401,
+              { "Content-Type": "application/json" },
+              JSON.stringify({ error: Cause.pretty(exchangeResult.cause) }),
+            );
+            return;
+          }
+
+          respond(
+            200,
+            { "Content-Type": "application/json" },
+            JSON.stringify(exchangeResult.value),
+          );
+          return;
+        }
+
+        if (url.pathname === MOBILE_TOKEN_REFRESH_ROUTE && req.method === "POST") {
+          const bodyText = yield* Effect.promise(() => readRequestBody(req)).pipe(
+            Effect.mapError(
+              () => new RouteRequestError({ message: "Failed to read request body." }),
+            ),
+          );
+          const requestBody = parseJsonObject(bodyText);
+          const refreshToken =
+            typeof requestBody?.refreshToken === "string" ? requestBody.refreshToken.trim() : "";
+          if (!refreshToken) {
+            respond(
+              400,
+              { "Content-Type": "application/json" },
+              JSON.stringify({ error: "refreshToken is required." }),
+            );
+            return;
+          }
+
+          const refreshResult = yield* mobileSessionManager
+            .refreshAccessToken({ refreshToken })
+            .pipe(Effect.exit);
+
+          if (Exit.isFailure(refreshResult)) {
+            respond(
+              401,
+              { "Content-Type": "application/json" },
+              JSON.stringify({ error: Cause.pretty(refreshResult.cause) }),
+            );
+            return;
+          }
+
+          respond(200, { "Content-Type": "application/json" }, JSON.stringify(refreshResult.value));
           return;
         }
 
@@ -594,6 +812,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
   const closeAllClients = Ref.get(clients).pipe(
     Effect.flatMap(Effect.forEach((client) => Effect.sync(() => client.close()))),
     Effect.flatMap(() => Ref.set(clients, new Set())),
+    Effect.flatMap(() => Ref.set(clientContexts, new Map())),
   );
 
   const listenOptions = host ? { host, port } : { port };
@@ -895,6 +1114,26 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         return { keybindings: keybindingsConfig, issues: [] };
       }
 
+      case WS_METHODS.serverCreateMobilePairing: {
+        const body = stripRequestTag(request.body);
+        return yield* mobileSessionManager.createPairingSecret(
+          body.ttlSeconds === undefined ? undefined : { ttlSeconds: body.ttlSeconds },
+        );
+      }
+
+      case WS_METHODS.serverListMobileDevices:
+        return yield* mobileSessionManager.listDevices();
+
+      case WS_METHODS.serverRevokeMobileDevice: {
+        const body = stripRequestTag(request.body);
+        const result = yield* mobileSessionManager.revokeDevice(body.deviceId);
+        if (result.revoked) {
+          yield* disconnectMobileConnectionsForDeviceId(body.deviceId);
+        }
+        yield* publishMobilePresence;
+        return result;
+      }
+
       default: {
         const _exhaustiveCheck: never = request.body;
         return yield* new RouteRequestError({
@@ -941,37 +1180,114 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     });
   });
 
+  const withConnectionContext = (
+    request: http.IncomingMessage,
+    context: ConnectionContext,
+  ): http.IncomingMessage & {
+    [CONNECTION_CONTEXT_SYMBOL]?: ConnectionContext;
+  } => {
+    const upgradedRequest = request as http.IncomingMessage & {
+      [CONNECTION_CONTEXT_SYMBOL]?: ConnectionContext;
+    };
+    upgradedRequest[CONNECTION_CONTEXT_SYMBOL] = context;
+    return upgradedRequest;
+  };
+
+  const removeTrackedClient = (ws: WebSocket) =>
+    Effect.all([
+      Ref.update(clients, (clients) => {
+        clients.delete(ws);
+        return clients;
+      }),
+      Ref.update(clientContexts, (contexts) => {
+        contexts.delete(ws);
+        return contexts;
+      }),
+    ]).pipe(Effect.flatMap(() => publishMobilePresence));
+
+  const disconnectMobileConnectionsForDeviceId = (deviceId: string) =>
+    Ref.get(clientContexts).pipe(
+      Effect.flatMap((contexts) =>
+        Effect.sync(() => {
+          for (const [client, context] of contexts.entries()) {
+            if (context.connectionKind !== "mobile" || context.connectionDeviceId !== deviceId) {
+              continue;
+            }
+            client.close(4001, "Device session revoked");
+          }
+        }),
+      ),
+    );
+
   httpServer.on("upgrade", (request, socket, head) => {
     socket.on("error", () => {}); // Prevent unhandled `EPIPE`/`ECONNRESET` from crashing the process if the client disconnects mid-handshake
 
-    if (authToken) {
-      let providedToken: string | null = null;
-      try {
-        const url = new URL(request.url ?? "/", `http://localhost:${port}`);
-        providedToken = url.searchParams.get("token");
-      } catch {
-        rejectUpgrade(socket, 400, "Invalid WebSocket URL");
-        return;
-      }
+    let providedToken: string | null = null;
+    try {
+      const url = new URL(request.url ?? "/", `http://localhost:${port}`);
+      providedToken = url.searchParams.get("token");
+    } catch {
+      rejectUpgrade(socket, 400, "Invalid WebSocket URL");
+      return;
+    }
 
-      if (providedToken !== authToken) {
-        rejectUpgrade(socket, 401, "Unauthorized WebSocket connection");
-        return;
-      }
+    if (authToken && providedToken === authToken) {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, withConnectionContext(request, { connectionKind: "desktop" }));
+      });
+      return;
+    }
+
+    if (providedToken) {
+      void runPromise(mobileSessionManager.validateAccessToken(providedToken)).then((result) => {
+        if (!result) {
+          rejectUpgrade(socket, 401, "Unauthorized WebSocket connection");
+          return;
+        }
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          wss.emit(
+            "connection",
+            ws,
+            withConnectionContext(request, {
+              connectionKind: "mobile",
+              connectionDeviceId: result.deviceId,
+              connectionDeviceName: result.deviceName,
+            }),
+          );
+        });
+      });
+      return;
+    }
+
+    if (authToken) {
+      rejectUpgrade(socket, 401, "Unauthorized WebSocket connection");
+      return;
     }
 
     wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
+      wss.emit("connection", ws, withConnectionContext(request, { connectionKind: "anonymous" }));
     });
   });
 
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, request) => {
     const segments = cwd.split(/[/\\]/).filter(Boolean);
     const projectName = segments[segments.length - 1] ?? "project";
+    const connectionContext = (
+      request as http.IncomingMessage & {
+        [CONNECTION_CONTEXT_SYMBOL]?: ConnectionContext;
+      }
+    )[CONNECTION_CONTEXT_SYMBOL] ?? { connectionKind: "anonymous" as const };
 
     const welcomeData = {
       cwd,
       projectName,
+      connectionKind: connectionContext.connectionKind,
+      ...(connectionContext.connectionDeviceId
+        ? { connectionDeviceId: connectionContext.connectionDeviceId }
+        : {}),
+      ...(connectionContext.connectionDeviceName
+        ? { connectionDeviceName: connectionContext.connectionDeviceName }
+        : {}),
       ...(welcomeBootstrapProjectId ? { bootstrapProjectId: welcomeBootstrapProjectId } : {}),
       ...(welcomeBootstrapThreadId ? { bootstrapThreadId: welcomeBootstrapThreadId } : {}),
     };
@@ -980,9 +1296,15 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     void runPromise(
       readiness.awaitServerReady.pipe(
         Effect.flatMap(() => pushBus.publishClient(ws, WS_CHANNELS.serverWelcome, welcomeData)),
-        Effect.flatMap((delivered) =>
-          delivered ? Ref.update(clients, (clients) => clients.add(ws)) : Effect.void,
-        ),
+        Effect.flatMap((delivered) => {
+          if (!delivered) {
+            return Effect.void;
+          }
+          return Effect.all([
+            Ref.update(clients, (clients) => clients.add(ws)),
+            Ref.update(clientContexts, (contexts) => contexts.set(ws, connectionContext)),
+          ]).pipe(Effect.flatMap(() => publishMobilePresence));
+        }),
       ),
     );
 
@@ -991,21 +1313,11 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     });
 
     ws.on("close", () => {
-      void runPromise(
-        Ref.update(clients, (clients) => {
-          clients.delete(ws);
-          return clients;
-        }),
-      );
+      void runPromise(removeTrackedClient(ws));
     });
 
     ws.on("error", () => {
-      void runPromise(
-        Ref.update(clients, (clients) => {
-          clients.delete(ws);
-          return clients;
-        }),
-      );
+      void runPromise(removeTrackedClient(ws));
     });
   });
 
