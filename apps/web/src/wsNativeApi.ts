@@ -4,6 +4,7 @@ import {
   ORCHESTRATION_WS_METHODS,
   type ContextMenuItem,
   type NativeApi,
+  type WsMobilePresencePayload,
   ServerConfigUpdatedPayload,
   WS_CHANNELS,
   WS_METHODS,
@@ -16,6 +17,7 @@ import { WsTransport } from "./wsTransport";
 let instance: { api: NativeApi; transport: WsTransport } | null = null;
 const welcomeListeners = new Set<(payload: WsWelcomePayload) => void>();
 const serverConfigUpdatedListeners = new Set<(payload: ServerConfigUpdatedPayload) => void>();
+const serverMobilePresenceListeners = new Set<(payload: WsMobilePresencePayload) => void>();
 const gitActionProgressListeners = new Set<(payload: GitActionProgressEvent) => void>();
 
 /**
@@ -64,6 +66,26 @@ export function onServerConfigUpdated(
   };
 }
 
+export function onServerMobilePresence(
+  listener: (payload: WsMobilePresencePayload) => void,
+): () => void {
+  serverMobilePresenceListeners.add(listener);
+
+  const latestPresence =
+    instance?.transport.getLatestPush(WS_CHANNELS.serverMobilePresence)?.data ?? null;
+  if (latestPresence) {
+    try {
+      listener(latestPresence);
+    } catch {
+      // Swallow listener errors
+    }
+  }
+
+  return () => {
+    serverMobilePresenceListeners.delete(listener);
+  };
+}
+
 export function createWsNativeApi(): NativeApi {
   if (instance) return instance.api;
 
@@ -82,6 +104,16 @@ export function createWsNativeApi(): NativeApi {
   transport.subscribe(WS_CHANNELS.serverConfigUpdated, (message) => {
     const payload = message.data;
     for (const listener of serverConfigUpdatedListeners) {
+      try {
+        listener(payload);
+      } catch {
+        // Swallow listener errors
+      }
+    }
+  });
+  transport.subscribe(WS_CHANNELS.serverMobilePresence, (message) => {
+    const payload = message.data;
+    for (const listener of serverMobilePresenceListeners) {
       try {
         listener(payload);
       } catch {
@@ -179,6 +211,10 @@ export function createWsNativeApi(): NativeApi {
     server: {
       getConfig: () => transport.request(WS_METHODS.serverGetConfig),
       upsertKeybinding: (input) => transport.request(WS_METHODS.serverUpsertKeybinding, input),
+      createMobilePairing: (input) =>
+        transport.request(WS_METHODS.serverCreateMobilePairing, input, { timeoutMs: 10_000 }),
+      listMobileDevices: () => transport.request(WS_METHODS.serverListMobileDevices),
+      revokeMobileDevice: (input) => transport.request(WS_METHODS.serverRevokeMobileDevice, input),
     },
     orchestration: {
       getSnapshot: () => transport.request(ORCHESTRATION_WS_METHODS.getSnapshot),

@@ -241,6 +241,18 @@ export class WsTransport {
       return;
     }
 
+    if (message.id === "unknown" && message.error) {
+      const pendingEntries = Array.from(this.pending.entries());
+      for (const [id, pendingRequest] of pendingEntries) {
+        if (pendingRequest.timeout !== null) {
+          clearTimeout(pendingRequest.timeout);
+        }
+        this.pending.delete(id);
+        pendingRequest.reject(new Error(message.error.message));
+      }
+      return;
+    }
+
     const pending = this.pending.get(message.id);
     if (!pending) {
       return;

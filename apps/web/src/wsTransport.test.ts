@@ -253,4 +253,24 @@ describe("WsTransport", () => {
     await expect(requestPromise).rejects.toThrow("WebSocket connection closed.");
     transport.dispose();
   });
+
+  it("rejects pending requests on unknown-id server error envelopes", async () => {
+    const transport = new WsTransport("ws://localhost:3020");
+    const socket = getSocket();
+    socket.open();
+
+    const requestPromise = transport.request("server.createMobilePairing", { ttlSeconds: 120 });
+
+    socket.serverMessage(
+      JSON.stringify({
+        id: "unknown",
+        error: {
+          message: "Invalid request format: Unknown method",
+        },
+      }),
+    );
+
+    await expect(requestPromise).rejects.toThrow("Invalid request format: Unknown method");
+    transport.dispose();
+  });
 });

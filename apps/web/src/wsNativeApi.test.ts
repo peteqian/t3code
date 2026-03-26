@@ -233,6 +233,29 @@ describe("wsNativeApi", () => {
     });
   });
 
+  it("delivers and caches server.mobilePresence payloads", async () => {
+    const { createWsNativeApi, onServerMobilePresence } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const listener = vi.fn();
+    onServerMobilePresence(listener);
+
+    const payload = {
+      mobileConnectionCount: 2,
+      deviceIds: ["device-a", "device-b"],
+      deviceNames: ["ios-simulator", "pixel-8"],
+    } as const;
+    emitPush(WS_CHANNELS.serverMobilePresence, payload);
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith(payload);
+
+    const lateListener = vi.fn();
+    onServerMobilePresence(lateListener);
+    expect(lateListener).toHaveBeenCalledTimes(1);
+    expect(lateListener).toHaveBeenCalledWith(payload);
+  });
+
   it("forwards valid terminal and orchestration events", async () => {
     const { createWsNativeApi } = await import("./wsNativeApi");
 
@@ -339,6 +362,37 @@ describe("wsNativeApi", () => {
       cwd: "/tmp/project",
       relativePath: "plan.md",
       contents: "# Plan\n",
+    });
+  });
+
+  it("forwards mobile pairing requests to the websocket server method", async () => {
+    requestMock.mockResolvedValue({ pairingCode: "AB12CD", expiresAt: "2026-01-01T00:00:00.000Z" });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    const api = createWsNativeApi();
+    await api.server.createMobilePairing({ ttlSeconds: 120 });
+
+    expect(requestMock).toHaveBeenCalledWith(
+      WS_METHODS.serverCreateMobilePairing,
+      {
+        ttlSeconds: 120,
+      },
+      { timeoutMs: 10_000 },
+    );
+  });
+
+  it("forwards mobile device listing and revoke requests", async () => {
+    requestMock.mockResolvedValueOnce({ devices: [] });
+    requestMock.mockResolvedValueOnce({ revoked: true });
+    const { createWsNativeApi } = await import("./wsNativeApi");
+
+    const api = createWsNativeApi();
+    await api.server.listMobileDevices();
+    await api.server.revokeMobileDevice({ deviceId: "device-1" });
+
+    expect(requestMock).toHaveBeenNthCalledWith(1, WS_METHODS.serverListMobileDevices);
+    expect(requestMock).toHaveBeenNthCalledWith(2, WS_METHODS.serverRevokeMobileDevice, {
+      deviceId: "device-1",
     });
   });
 
