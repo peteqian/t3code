@@ -16,6 +16,7 @@ const buildSourcemap =
       : true;
 
 export default defineConfig({
+  clearScreen: false,
   plugins: [
     tanstackRouter(),
     react(),

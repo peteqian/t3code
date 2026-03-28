@@ -37,6 +37,7 @@ import {
 } from "../components/ui/select";
 import { SidebarTrigger } from "../components/ui/sidebar";
 import { Switch } from "../components/ui/switch";
+import { Tooltip, TooltipTrigger, TooltipPopup } from "../components/ui/tooltip";
 import { ProviderModelPicker } from "../components/chat/ProviderModelPicker";
 import { TraitsPicker } from "../components/chat/TraitsPicker";
 import { SidebarInset } from "../components/ui/sidebar";
