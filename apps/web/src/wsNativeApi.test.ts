@@ -13,7 +13,7 @@ import {
   WS_CHANNELS,
   WS_METHODS,
   type WsPush,
-  type ServerProviderStatus,
+  type ServerProvider,
 } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -92,13 +92,16 @@ function getWindowForTest(): Window & typeof globalThis & { desktopBridge?: unkn
   return testGlobal.window;
 }
 
-const defaultProviders: ReadonlyArray<ServerProviderStatus> = [
+const defaultProviders: ReadonlyArray<ServerProvider> = [
   {
     provider: "codex",
+    enabled: true,
+    installed: true,
+    version: "0.116.0",
     status: "ready",
-    available: true,
     authStatus: "authenticated",
     checkedAt: "2026-01-01T00:00:00.000Z",
+    models: [],
   },
 ];
 
@@ -197,7 +200,6 @@ describe("wsNativeApi", () => {
           message: "Entry at index 1 is invalid.",
         },
       ],
-      providers: defaultProviders,
     } as const;
     emitPush(WS_CHANNELS.serverConfigUpdated, payload);
 
@@ -219,17 +221,14 @@ describe("wsNativeApi", () => {
 
     emitPush(WS_CHANNELS.serverConfigUpdated, {
       issues: [{ kind: "keybindings.malformed-config", message: "bad json" }],
-      providers: defaultProviders,
     });
     emitPush(WS_CHANNELS.serverConfigUpdated, {
       issues: [],
-      providers: defaultProviders,
     });
 
     expect(listener).toHaveBeenCalledTimes(2);
     expect(listener).toHaveBeenLastCalledWith({
       issues: [],
-      providers: defaultProviders,
     });
   });
 
@@ -252,6 +251,27 @@ describe("wsNativeApi", () => {
 
     const lateListener = vi.fn();
     onServerMobilePresence(lateListener);
+    expect(lateListener).toHaveBeenCalledTimes(1);
+    expect(lateListener).toHaveBeenCalledWith(payload);
+  });
+
+  it("delivers and caches valid server.providersUpdated payloads", async () => {
+    const { createWsNativeApi, onServerProvidersUpdated } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const listener = vi.fn();
+    onServerProvidersUpdated(listener);
+
+    const payload = {
+      providers: defaultProviders,
+    } as const;
+    emitPush(WS_CHANNELS.serverProvidersUpdated, payload);
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith(payload);
+
+    const lateListener = vi.fn();
+    onServerProvidersUpdated(lateListener);
     expect(lateListener).toHaveBeenCalledTimes(1);
     expect(lateListener).toHaveBeenCalledWith(payload);
   });
@@ -411,10 +431,6 @@ describe("wsNativeApi", () => {
       actionId: "action-1",
       cwd: "/repo",
       action: "commit",
-      modelSelection: {
-        provider: "codex",
-        model: "gpt-5.4-mini",
-      },
     });
 
     expect(requestMock).toHaveBeenCalledWith(
@@ -423,10 +439,6 @@ describe("wsNativeApi", () => {
         actionId: "action-1",
         cwd: "/repo",
         action: "commit",
-        modelSelection: {
-          provider: "codex",
-          model: "gpt-5.4-mini",
-        },
       },
       { timeoutMs: null },
     );
