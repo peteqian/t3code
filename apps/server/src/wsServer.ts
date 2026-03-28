@@ -1195,7 +1195,6 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         const body = stripRequestTag(request.body);
         return yield* serverSettingsManager.updateSettings(body.patch);
       }
-      }
 
       default: {
         const _exhaustiveCheck: never = request.body;
