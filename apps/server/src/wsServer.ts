@@ -259,6 +259,10 @@ const decodeWebSocketRequest = decodeJsonResult(WebSocketRequest);
 const MOBILE_PAIRING_CREATE_ROUTE = "/api/mobile/pairing/create";
 const MOBILE_PAIRING_EXCHANGE_ROUTE = "/api/mobile/pairing/exchange";
 const MOBILE_TOKEN_REFRESH_ROUTE = "/api/mobile/token/refresh";
+const isMobileRoute = (pathname: string) =>
+  pathname === MOBILE_PAIRING_CREATE_ROUTE ||
+  pathname === MOBILE_PAIRING_EXCHANGE_ROUTE ||
+  pathname === MOBILE_TOKEN_REFRESH_ROUTE;
 const CONNECTION_CONTEXT_SYMBOL = Symbol("t3.connection-context");
 
 interface ConnectionContext {
@@ -535,11 +539,19 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           return;
         }
 
+        // Add CORS headers for mobile API routes
+        const addCorsHeaders = (headers: Record<string, string>) => {
+          if (isMobileRoute(url.pathname)) {
+            headers["Access-Control-Allow-Origin"] = "*";
+          }
+          return headers;
+        };
+
         if (url.pathname === MOBILE_PAIRING_CREATE_ROUTE && req.method === "POST") {
           if (authToken) {
             const bearerToken = readBearerToken(req);
             if (bearerToken !== authToken) {
-              respond(401, { "Content-Type": "text/plain" }, "Unauthorized");
+              respond(401, addCorsHeaders({ "Content-Type": "text/plain" }), "Unauthorized");
               return;
             }
           }
@@ -553,7 +565,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           if (!requestBody) {
             respond(
               400,
-              { "Content-Type": "application/json" },
+              addCorsHeaders({ "Content-Type": "application/json" }),
               JSON.stringify({ error: "Expected a JSON object body." }),
             );
             return;
@@ -570,7 +582,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           ) {
             respond(
               400,
-              { "Content-Type": "application/json" },
+              addCorsHeaders({ "Content-Type": "application/json" }),
               JSON.stringify({ error: "ttlSeconds must be an integer between 30 and 300." }),
             );
             return;
@@ -579,7 +591,11 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           const result = yield* mobileSessionManager.createPairingSecret(
             ttlSeconds === undefined ? undefined : { ttlSeconds },
           );
-          respond(200, { "Content-Type": "application/json" }, JSON.stringify(result));
+          respond(
+            200,
+            addCorsHeaders({ "Content-Type": "application/json" }),
+            JSON.stringify(result),
+          );
           return;
         }
 
@@ -597,7 +613,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           if (!pairingCode || !deviceName) {
             respond(
               400,
-              { "Content-Type": "application/json" },
+              addCorsHeaders({ "Content-Type": "application/json" }),
               JSON.stringify({ error: "pairingCode and deviceName are required." }),
             );
             return;
@@ -610,7 +626,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           if (Exit.isFailure(exchangeResult)) {
             respond(
               401,
-              { "Content-Type": "application/json" },
+              addCorsHeaders({ "Content-Type": "application/json" }),
               JSON.stringify({ error: Cause.pretty(exchangeResult.cause) }),
             );
             return;
@@ -618,7 +634,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
 
           respond(
             200,
-            { "Content-Type": "application/json" },
+            addCorsHeaders({ "Content-Type": "application/json" }),
             JSON.stringify(exchangeResult.value),
           );
           return;
@@ -636,7 +652,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           if (!refreshToken) {
             respond(
               400,
-              { "Content-Type": "application/json" },
+              addCorsHeaders({ "Content-Type": "application/json" }),
               JSON.stringify({ error: "refreshToken is required." }),
             );
             return;
@@ -649,13 +665,17 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           if (Exit.isFailure(refreshResult)) {
             respond(
               401,
-              { "Content-Type": "application/json" },
+              addCorsHeaders({ "Content-Type": "application/json" }),
               JSON.stringify({ error: Cause.pretty(refreshResult.cause) }),
             );
             return;
           }
 
-          respond(200, { "Content-Type": "application/json" }, JSON.stringify(refreshResult.value));
+          respond(
+            200,
+            addCorsHeaders({ "Content-Type": "application/json" }),
+            JSON.stringify(refreshResult.value),
+          );
           return;
         }
 
