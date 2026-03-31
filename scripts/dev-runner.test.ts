@@ -59,6 +59,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           autoBootstrapProjectFromCwd: undefined,
           logWebSocketEvents: undefined,
           host: undefined,
+          publicHost: undefined,
           port: undefined,
           devUrl: undefined,
         });
@@ -80,17 +81,20 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           autoBootstrapProjectFromCwd: false,
           logWebSocketEvents: true,
           host: "0.0.0.0",
+          publicHost: "192.168.230.12",
           port: 4222,
           devUrl: new URL("http://localhost:7331"),
         });
 
         assert.equal(env.T3CODE_HOME, resolve("/tmp/custom-t3"));
         assert.equal(env.T3CODE_PORT, "4222");
-        assert.equal(env.VITE_WS_URL, "ws://localhost:4222");
+        assert.equal(env.VITE_WS_URL, "ws://192.168.230.12:4222");
         assert.equal(env.T3CODE_NO_BROWSER, "1");
         assert.equal(env.T3CODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD, "0");
         assert.equal(env.T3CODE_LOG_WS_EVENTS, "1");
         assert.equal(env.T3CODE_HOST, "0.0.0.0");
+        assert.equal(env.T3CODE_PUBLIC_HOST, "192.168.230.12");
+        assert.equal(env.T3CODE_VITE_HOST, "0.0.0.0");
         assert.equal(env.VITE_DEV_SERVER_URL, "http://localhost:7331/");
       }),
     );
@@ -110,6 +114,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           autoBootstrapProjectFromCwd: undefined,
           logWebSocketEvents: undefined,
           host: undefined,
+          publicHost: undefined,
           port: undefined,
           devUrl: undefined,
         });
@@ -132,6 +137,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           autoBootstrapProjectFromCwd: undefined,
           logWebSocketEvents: false,
           host: undefined,
+          publicHost: undefined,
           port: undefined,
           devUrl: undefined,
         });
@@ -153,6 +159,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           autoBootstrapProjectFromCwd: undefined,
           logWebSocketEvents: undefined,
           host: undefined,
+          publicHost: undefined,
           port: undefined,
           devUrl: undefined,
         });
@@ -171,6 +178,8 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
             T3CODE_MODE: "web",
             T3CODE_NO_BROWSER: "0",
             T3CODE_HOST: "0.0.0.0",
+            T3CODE_PUBLIC_HOST: "192.168.230.12",
+            T3CODE_VITE_HOST: "0.0.0.0",
             VITE_WS_URL: "ws://localhost:3773",
           },
           serverOffset: 0,
@@ -181,6 +190,7 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
           autoBootstrapProjectFromCwd: undefined,
           logWebSocketEvents: undefined,
           host: "127.0.0.1",
+          publicHost: "192.168.230.12",
           port: 4222,
           devUrl: undefined,
         });
@@ -194,7 +204,35 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
         assert.equal(env.T3CODE_MODE, undefined);
         assert.equal(env.T3CODE_NO_BROWSER, undefined);
         assert.equal(env.T3CODE_HOST, undefined);
+        assert.equal(env.T3CODE_PUBLIC_HOST, undefined);
+        assert.equal(env.T3CODE_VITE_HOST, undefined);
         assert.equal(env.VITE_WS_URL, undefined);
+      }),
+    );
+
+    it.effect("uses public host for LAN-safe browser and websocket URLs", () =>
+      Effect.gen(function* () {
+        const env = yield* createDevRunnerEnv({
+          mode: "dev",
+          baseEnv: {},
+          serverOffset: 0,
+          webOffset: 0,
+          t3Home: undefined,
+          authToken: undefined,
+          noBrowser: undefined,
+          autoBootstrapProjectFromCwd: undefined,
+          logWebSocketEvents: undefined,
+          host: "0.0.0.0",
+          publicHost: "100.88.10.4",
+          port: undefined,
+          devUrl: undefined,
+        });
+
+        assert.equal(env.T3CODE_HOST, "0.0.0.0");
+        assert.equal(env.T3CODE_PUBLIC_HOST, "100.88.10.4");
+        assert.equal(env.T3CODE_VITE_HOST, "0.0.0.0");
+        assert.equal(env.VITE_DEV_SERVER_URL, "http://100.88.10.4:5733");
+        assert.equal(env.VITE_WS_URL, "ws://100.88.10.4:3773");
       }),
     );
   });

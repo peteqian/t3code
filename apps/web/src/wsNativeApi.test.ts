@@ -255,6 +255,34 @@ describe("wsNativeApi", () => {
     expect(lateListener).toHaveBeenCalledWith(payload);
   });
 
+  it("delivers and caches server.mobileAccessRequests payloads", async () => {
+    const { createWsNativeApi, onServerMobileAccessRequests } = await import("./wsNativeApi");
+
+    createWsNativeApi();
+    const listener = vi.fn();
+    onServerMobileAccessRequests(listener);
+
+    const payload = {
+      requests: [
+        {
+          requestId: "request-1",
+          deviceName: "iPhone",
+          createdAt: "2026-03-31T17:00:00.000Z",
+          expiresAt: "2026-03-31T17:02:00.000Z",
+        },
+      ],
+    } as const;
+    emitPush(WS_CHANNELS.serverMobileAccessRequests, payload);
+
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith(payload);
+
+    const lateListener = vi.fn();
+    onServerMobileAccessRequests(lateListener);
+    expect(lateListener).toHaveBeenCalledTimes(1);
+    expect(lateListener).toHaveBeenCalledWith(payload);
+  });
+
   it("delivers and caches valid server.providersUpdated payloads", async () => {
     const { createWsNativeApi, onServerProvidersUpdated } = await import("./wsNativeApi");
 
@@ -385,18 +413,28 @@ describe("wsNativeApi", () => {
     });
   });
 
-  it("forwards mobile pairing requests to the websocket server method", async () => {
-    requestMock.mockResolvedValue({ pairingCode: "AB12CD", expiresAt: "2026-01-01T00:00:00.000Z" });
+  it("forwards mobile access approval requests to the websocket server methods", async () => {
+    requestMock.mockResolvedValueOnce({ requests: [] });
+    requestMock.mockResolvedValueOnce({ approved: true });
+    requestMock.mockResolvedValueOnce({ rejected: true });
     const { createWsNativeApi } = await import("./wsNativeApi");
 
     const api = createWsNativeApi();
-    await api.server.createMobilePairing({ ttlSeconds: 120 });
+    await api.server.listMobileAccessRequests();
+    await api.server.approveMobileAccessRequest({ requestId: "request-1" });
+    await api.server.rejectMobileAccessRequest({ requestId: "request-2" });
 
-    expect(requestMock).toHaveBeenCalledWith(
-      WS_METHODS.serverCreateMobilePairing,
-      {
-        ttlSeconds: 120,
-      },
+    expect(requestMock).toHaveBeenNthCalledWith(1, WS_METHODS.serverListMobileAccessRequests);
+    expect(requestMock).toHaveBeenNthCalledWith(
+      2,
+      WS_METHODS.serverApproveMobileAccessRequest,
+      { requestId: "request-1" },
+      { timeoutMs: 10_000 },
+    );
+    expect(requestMock).toHaveBeenNthCalledWith(
+      3,
+      WS_METHODS.serverRejectMobileAccessRequest,
+      { requestId: "request-2" },
       { timeoutMs: 10_000 },
     );
   });

@@ -1,69 +1,35 @@
-import { type MobilePairingCreateResponse } from "@t3tools/contracts";
 import { useCallback, useEffect, useState } from "react";
 
-import { useCopyToClipboard } from "../../hooks/useCopyToClipboard";
+import type { MobileDeviceSummary } from "@t3tools/contracts";
+
+import {
+  useMobileAccessRequests,
+  toMobileAccessErrorMessage,
+} from "../../hooks/useMobileAccessRequests";
 import { cn } from "../../lib/utils";
 import { ensureNativeApi } from "../../nativeApi";
 import { onServerMobilePresence } from "../../wsNativeApi";
-import { SettingsRow } from "./SettingsPrimitives";
 import { Button } from "../ui/button";
+import { SettingsRow } from "./SettingsPrimitives";
 
-interface MobileDeviceSummary {
-  readonly deviceId: string;
-  readonly deviceName: string;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-}
-
-function toMobileSettingsErrorMessage(error: unknown, fallback: string): string {
-  if (!(error instanceof Error)) {
-    return fallback;
-  }
-  if (
-    error.message.includes("server.listMobileDevices") ||
-    error.message.includes("server.revokeMobileDevice")
-  ) {
-    return "Mobile device management requires a server restart.";
-  }
-  return error.message;
-}
-
-/**
- * Renders and manages mobile pairing, presence, and paired-device controls.
- */
 export function MobileCompanionSettingsRow() {
-  const [mobilePairing, setMobilePairing] = useState<MobilePairingCreateResponse | null>(null);
-  const [isCreatingMobilePairing, setIsCreatingMobilePairing] = useState(false);
-  const [mobilePairingError, setMobilePairingError] = useState<string | null>(null);
   const [connectedDeviceLabel, setConnectedDeviceLabel] = useState<string>("None");
   const [isMobileConnected, setIsMobileConnected] = useState(false);
   const [onlineDeviceIds, setOnlineDeviceIds] = useState<ReadonlySet<string>>(new Set());
   const [mobileDevices, setMobileDevices] = useState<ReadonlyArray<MobileDeviceSummary>>([]);
-  const [isLoadingMobileDevices, setIsLoadingMobileDevices] = useState(false);
+  const [mobileDevicesError, setMobileDevicesError] = useState<string | null>(null);
+  const [isRefreshingDevices, setIsRefreshingDevices] = useState(false);
   const [revokingDeviceId, setRevokingDeviceId] = useState<string | null>(null);
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  const { copyToClipboard, isCopied } = useCopyToClipboard<void>({
-    onError: () => {
-      setMobilePairingError("Clipboard unavailable in this environment.");
-    },
-  });
-
-  const mobilePairingExpiresAtMs = mobilePairing ? Date.parse(mobilePairing.expiresAt) : null;
-  const mobilePairingSecondsRemaining =
-    mobilePairingExpiresAtMs === null
-      ? null
-      : Math.max(0, Math.ceil((mobilePairingExpiresAtMs - nowMs) / 1000));
-  const mobilePairingExpired =
-    mobilePairingSecondsRemaining !== null && mobilePairingSecondsRemaining <= 0;
-
-  useEffect(() => {
-    const interval = globalThis.setInterval(() => {
-      setNowMs(Date.now());
-    }, 1_000);
-    return () => {
-      globalThis.clearInterval(interval);
-    };
-  }, []);
+  const {
+    pendingRequests,
+    isRefreshing,
+    mobileAccessError,
+    approveRequestId,
+    rejectRequestId,
+    refreshRequests,
+    approveRequest,
+    rejectRequest,
+  } = useMobileAccessRequests();
 
   useEffect(() => {
     return onServerMobilePresence((payload) => {
@@ -73,11 +39,13 @@ export function MobileCompanionSettingsRow() {
         setConnectedDeviceLabel("None");
         return;
       }
+
       setIsMobileConnected(true);
       if (payload.deviceNames.length <= 0) {
         setConnectedDeviceLabel("Mobile device");
         return;
       }
+
       const firstDevice = payload.deviceNames[0] ?? "Mobile device";
       const extraCount = Math.max(0, payload.deviceNames.length - 1);
       setConnectedDeviceLabel(extraCount > 0 ? `${firstDevice} +${extraCount}` : firstDevice);
@@ -85,33 +53,33 @@ export function MobileCompanionSettingsRow() {
   }, []);
 
   const loadMobileDevices = useCallback(async () => {
-    setIsLoadingMobileDevices(true);
-    setMobilePairingError(null);
+    setIsRefreshingDevices(true);
+    setMobileDevicesError(null);
+
     try {
       const api = ensureNativeApi();
       const result = await api.server.listMobileDevices();
       setMobileDevices(result.devices);
     } catch (error) {
-      setMobilePairingError(
-        toMobileSettingsErrorMessage(error, "Unable to load paired mobile devices."),
+      setMobileDevicesError(
+        toMobileAccessErrorMessage(error, "Unable to load paired mobile devices."),
       );
     } finally {
-      setIsLoadingMobileDevices(false);
+      setIsRefreshingDevices(false);
     }
   }, []);
 
   const revokeMobileDevice = useCallback(
     async (deviceId: string) => {
       setRevokingDeviceId(deviceId);
-      setMobilePairingError(null);
+      setMobileDevicesError(null);
+
       try {
         const api = ensureNativeApi();
         await api.server.revokeMobileDevice({ deviceId });
         await loadMobileDevices();
       } catch (error) {
-        setMobilePairingError(
-          toMobileSettingsErrorMessage(error, "Unable to revoke mobile device."),
-        );
+        setMobileDevicesError(toMobileAccessErrorMessage(error, "Unable to revoke mobile device."));
       } finally {
         setRevokingDeviceId(null);
       }
@@ -119,67 +87,32 @@ export function MobileCompanionSettingsRow() {
     [loadMobileDevices],
   );
 
+  const refreshMobileState = useCallback(async () => {
+    await Promise.all([refreshRequests(), loadMobileDevices()]);
+  }, [loadMobileDevices, refreshRequests]);
+
   useEffect(() => {
     void loadMobileDevices();
   }, [loadMobileDevices]);
 
-  const createMobilePairingCode = useCallback(async () => {
-    setIsCreatingMobilePairing(true);
-    setMobilePairingError(null);
-    try {
-      const api = ensureNativeApi();
-      const pairing = await api.server.createMobilePairing({ ttlSeconds: 120 });
-      setMobilePairing(pairing);
-    } catch (error) {
-      setMobilePairingError(
-        error instanceof Error ? error.message : "Unable to create mobile pairing code.",
-      );
-    } finally {
-      setIsCreatingMobilePairing(false);
-    }
-  }, []);
-
   return (
     <SettingsRow
       title="Mobile companion"
-      description="Generate a short pairing code to link the mobile app without sharing server auth tokens."
+      description="Approve nearby mobile devices from your Mac, then let them reconnect with saved tokens."
       control={
         <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
-          {mobilePairing ? (
-            <Button
-              size="xs"
-              variant="outline"
-              onClick={() => {
-                copyToClipboard(mobilePairing.pairingCode, undefined);
-              }}
-            >
-              {isCopied ? "Copied" : "Copy code"}
-            </Button>
-          ) : null}
           <Button
             size="xs"
             variant="outline"
-            disabled={isLoadingMobileDevices}
-            onClick={() => void loadMobileDevices()}
+            disabled={isRefreshing || isRefreshingDevices}
+            onClick={() => void refreshMobileState()}
           >
-            {isLoadingMobileDevices ? "Refreshing..." : "Refresh devices"}
-          </Button>
-          <Button
-            size="xs"
-            variant="outline"
-            disabled={isCreatingMobilePairing}
-            onClick={() => void createMobilePairingCode()}
-          >
-            {isCreatingMobilePairing
-              ? "Generating..."
-              : mobilePairing
-                ? "Regenerate"
-                : "Generate code"}
+            {isRefreshing || isRefreshingDevices ? "Refreshing..." : "Refresh"}
           </Button>
         </div>
       }
     >
-      <div className="mt-4 space-y-2 border-t border-border pt-4">
+      <div className="mt-4 space-y-3 border-t border-border pt-4">
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span
             className={cn(
@@ -189,19 +122,52 @@ export function MobileCompanionSettingsRow() {
           />
           <span>Connected device: {connectedDeviceLabel}</span>
         </div>
-        {mobilePairing ? (
-          <>
-            <div className="inline-flex rounded-md border border-border bg-muted px-3 py-2 font-mono text-sm tracking-[0.16em] text-foreground">
-              {mobilePairing.pairingCode}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {mobilePairingExpired
-                ? "Code expired. Generate a new one."
-                : `Code expires in ${mobilePairingSecondsRemaining ?? 0}s.`}
-            </p>
-          </>
-        ) : null}
+
+        <div className="space-y-2">
+          <h4 className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">
+            Pending approval
+          </h4>
+          {pendingRequests.length <= 0 ? (
+            <p className="text-xs text-muted-foreground">No pending mobile access requests.</p>
+          ) : (
+            pendingRequests.map((request) => (
+              <div
+                key={request.requestId}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border px-3 py-2"
+              >
+                <div className="min-w-0 text-xs">
+                  <p className="truncate font-medium text-foreground">{request.deviceName}</p>
+                  <p className="text-muted-foreground">
+                    Expires {new Date(request.expiresAt).toLocaleTimeString()}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={approveRequestId === request.requestId}
+                    onClick={() => void approveRequest(request.requestId)}
+                  >
+                    {approveRequestId === request.requestId ? "Approving..." : "Approve"}
+                  </Button>
+                  <Button
+                    size="xs"
+                    variant="outline"
+                    disabled={rejectRequestId === request.requestId}
+                    onClick={() => void rejectRequest(request.requestId)}
+                  >
+                    {rejectRequestId === request.requestId ? "Rejecting..." : "Reject"}
+                  </Button>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+
         <div className="space-y-2 pt-2">
+          <h4 className="text-xs font-medium uppercase tracking-[0.14em] text-muted-foreground">
+            Paired devices
+          </h4>
           {mobileDevices.length <= 0 ? (
             <p className="text-xs text-muted-foreground">No paired devices yet.</p>
           ) : (
@@ -239,8 +205,10 @@ export function MobileCompanionSettingsRow() {
             })
           )}
         </div>
-        {mobilePairingError ? (
-          <p className="text-xs text-destructive">{mobilePairingError}</p>
+
+        {mobileAccessError ? <p className="text-xs text-destructive">{mobileAccessError}</p> : null}
+        {mobileDevicesError ? (
+          <p className="text-xs text-destructive">{mobileDevicesError}</p>
         ) : null}
       </div>
     </SettingsRow>

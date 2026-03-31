@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import type { OrchestrationSessionStatus } from "@t3tools/contracts";
+import { Button, Card, StatusPill, type StatusTone } from "@t3tools/ui";
 import { Menu, Settings } from "lucide-react";
 import { toStatusChipColor, useCompanionController } from "./hooks/useCompanionController";
 
@@ -16,7 +17,7 @@ interface SessionCardModel {
 
 function toTopStatusChip(socketState: string): {
   label: string;
-  color: "accent" | "success" | "warning" | "danger" | "default";
+  color: StatusTone;
 } {
   if (socketState === "connected") return { label: "Connected", color: "success" };
   if (socketState === "connecting") return { label: "Connecting", color: "accent" };
@@ -72,7 +73,7 @@ export default function App() {
         </button>
         <div className="top-center">
           <h1 className="app-title">T3 Companion</h1>
-          <span className={`status-chip status-${topStatusChip.color}`}>{topStatusChip.label}</span>
+          <StatusPill tone={topStatusChip.color} label={topStatusChip.label} />
         </div>
         <button
           className="icon-button"
@@ -96,24 +97,26 @@ export default function App() {
 
         {showSettings && (
           <SettingsPanel
-            connectionMode={controller.connectionMode}
-            onChangeConnectionMode={controller.setConnectionMode}
             deviceName={controller.deviceName}
             onChangeDeviceName={controller.setDeviceName}
-            pairingCode={controller.pairingCode}
-            onChangePairingCode={controller.setPairingCode}
-            localServerBaseUrl={controller.localServerBaseUrl}
-            onChangeLocalServerBaseUrl={controller.setLocalServerBaseUrl}
-            vpnServerBaseUrl={controller.vpnServerBaseUrl}
-            onChangeVpnServerBaseUrl={controller.setVpnServerBaseUrl}
+            accessRequest={controller.accessRequest}
+            serverBaseUrl={controller.serverBaseUrl}
+            onChangeServerBaseUrl={controller.setServerBaseUrl}
+            discoveredServers={controller.discoveredServers}
+            isScanningServers={controller.isScanningServers}
+            onScanServers={() => void controller.handleScanServers()}
+            onUseDiscoveredServer={controller.setServerBaseUrl}
             showAdvancedNetworkSettings={controller.showAdvancedNetworkSettings}
             onToggleAdvancedNetworkSettings={() =>
               controller.setShowAdvancedNetworkSettings((prev) => !prev)
             }
-            onPairDevice={() => void controller.handlePairDevice()}
+            onRequestAccess={() => void controller.handleRequestAccess()}
             onConnect={() => void controller.handleConnect()}
             onDisconnect={controller.handleDisconnect}
             onForgetSession={() => void controller.handleForgetSession()}
+            isBusy={controller.isBusy}
+            socketState={controller.socketState}
+            hasSession={controller.sessionBundle !== null}
           />
         )}
 
@@ -125,7 +128,7 @@ export default function App() {
           </div>
         )}
 
-        <div className="composer-card">
+        <Card className="composer-card">
           <textarea
             className="composer-input"
             placeholder="Ask anything to start a new session"
@@ -134,33 +137,30 @@ export default function App() {
             rows={5}
           />
           <div className="composer-actions">
-            <button
-              className="button button-primary"
+            <Button
+              tone="primary"
               onClick={() => void handleStartFromComposer()}
               disabled={controller.isSubmittingPrompt}
             >
               {controller.isSubmittingPrompt ? "Starting..." : "Start session"}
-            </button>
+            </Button>
           </div>
-        </div>
+        </Card>
 
         <div className="recent-sessions">
           <div className="section-header">
             <h2>Recent sessions</h2>
-            <button
-              className="button button-ghost"
-              onClick={() => void controller.handleRefreshSessions()}
-            >
+            <Button tone="ghost" onClick={() => void controller.handleRefreshSessions()}>
               {controller.isRefreshingSessions ? "Refreshing..." : "Refresh"}
-            </button>
+            </Button>
           </div>
 
           {recentSessions.length === 0 ? (
-            <div className="card">
+            <Card>
               <p className="text-muted">
                 No recent sessions yet. Pair and connect first to sync from server.
               </p>
-            </div>
+            </Card>
           ) : (
             recentSessions.map((session) => (
               <SessionCard
@@ -183,7 +183,7 @@ interface SessionMenuProps {
 
 function SessionMenu({ sessions, formatStatus }: SessionMenuProps) {
   return (
-    <div className="card">
+    <Card>
       <h3>All sessions</h3>
       <div className="session-list">
         {sessions.length === 0 ? (
@@ -195,41 +195,54 @@ function SessionMenu({ sessions, formatStatus }: SessionMenuProps) {
                 <span className="session-title">{session.title}</span>
                 <span className="session-project">{session.projectTitle}</span>
               </div>
-              <span className={`status-chip status-${toStatusChipColor(session.status)}`}>
-                {formatStatus(session.status)}
-              </span>
+              <StatusPill
+                tone={toStatusChipColor(session.status)}
+                label={formatStatus(session.status)}
+              />
             </div>
           ))
         )}
       </div>
-    </div>
+    </Card>
   );
 }
 
 interface SettingsPanelProps {
-  connectionMode: string;
-  onChangeConnectionMode: (mode: "auto" | "local" | "vpn") => void;
   deviceName: string;
   onChangeDeviceName: (value: string) => void;
-  pairingCode: string;
-  onChangePairingCode: (value: string) => void;
-  localServerBaseUrl: string;
-  onChangeLocalServerBaseUrl: (value: string) => void;
-  vpnServerBaseUrl: string;
-  onChangeVpnServerBaseUrl: (value: string) => void;
+  accessRequest: {
+    requestId: string;
+    status: "pending" | "approved" | "rejected" | "expired";
+    expiresAt: string;
+  } | null;
+  serverBaseUrl: string;
+  onChangeServerBaseUrl: (value: string) => void;
+  discoveredServers: readonly { id: string; name: string; baseUrl: string }[];
+  isScanningServers: boolean;
+  onScanServers: () => void;
+  onUseDiscoveredServer: (value: string) => void;
   showAdvancedNetworkSettings: boolean;
   onToggleAdvancedNetworkSettings: () => void;
-  onPairDevice: () => void;
+  onRequestAccess: () => void;
   onConnect: () => void;
   onDisconnect: () => void;
   onForgetSession: () => void;
+  isBusy: boolean;
+  socketState: "disconnected" | "connecting" | "connected" | "error";
+  hasSession: boolean;
 }
 
 function SettingsPanel(props: SettingsPanelProps) {
+  const selectedDiscoveredServer = props.discoveredServers.find(
+    (server) => server.baseUrl === props.serverBaseUrl,
+  );
+  const isConnected = props.socketState === "connected";
+  const isConnecting = props.socketState === "connecting";
+
   return (
-    <div className="card settings-panel">
+    <Card className="settings-panel">
       <h3>Connection settings</h3>
-      <p className="text-muted">Configure pairing and network preferences.</p>
+      <p className="text-muted">Pair with a nearby server. Manual server URL stays in advanced.</p>
 
       <div className="form-group">
         <label>Device name</label>
@@ -242,69 +255,100 @@ function SettingsPanel(props: SettingsPanelProps) {
       </div>
 
       <div className="form-group">
-        <label>Pairing code</label>
-        <input
-          type="text"
-          value={props.pairingCode}
-          onChange={(e) => props.onChangePairingCode(e.target.value)}
-          placeholder="Pairing code"
-        />
+        <label>Access approval</label>
+        <p className="text-muted">Request access here, then approve this device from your Mac.</p>
+        <p className="text-muted">
+          Active server: {selectedDiscoveredServer?.name ?? props.serverBaseUrl}
+        </p>
+        {props.accessRequest ? (
+          <p className="text-muted">
+            Current request: {props.accessRequest.status} until{" "}
+            {new Date(props.accessRequest.expiresAt).toLocaleTimeString()}
+          </p>
+        ) : null}
+      </div>
+
+      <div className="form-group">
+        <div className="section-header">
+          <label>Nearby servers</label>
+          <Button
+            tone="ghost"
+            onClick={props.onScanServers}
+            disabled={props.isBusy || isConnecting}
+          >
+            {props.isScanningServers ? "Scanning..." : "Scan"}
+          </Button>
+        </div>
+        <div className="session-list">
+          {props.discoveredServers.length <= 0 ? (
+            <p className="text-muted">No nearby servers found yet.</p>
+          ) : (
+            props.discoveredServers.map((server) => (
+              <div key={server.id} className="session-row">
+                <div className="session-info">
+                  <span className="session-title">{server.name}</span>
+                  <span className="session-project">{server.baseUrl}</span>
+                </div>
+                <Button
+                  tone="outline"
+                  onClick={() => props.onUseDiscoveredServer(server.baseUrl)}
+                  disabled={props.isBusy || isConnecting}
+                >
+                  {server.baseUrl === props.serverBaseUrl ? "Selected" : "Use"}
+                </Button>
+              </div>
+            ))
+          )}
+        </div>
       </div>
 
       <div className="button-row">
-        <button className="button button-primary" onClick={props.onPairDevice}>
-          Pair device
-        </button>
-        <button className="button button-secondary" onClick={props.onConnect}>
-          Connect
-        </button>
-        <button className="button button-outline" onClick={props.onDisconnect}>
+        <Button
+          tone="primary"
+          onClick={props.onRequestAccess}
+          disabled={props.isBusy || isConnecting}
+        >
+          {props.isBusy && !props.hasSession ? "Requesting..." : "Request access"}
+        </Button>
+        <Button
+          tone="secondary"
+          onClick={props.onConnect}
+          disabled={props.isBusy || isConnecting || isConnected || !props.hasSession}
+        >
+          {isConnecting ? "Connecting..." : isConnected ? "Connected" : "Connect"}
+        </Button>
+        <Button
+          tone="outline"
+          onClick={props.onDisconnect}
+          disabled={(!isConnected && !isConnecting) || props.isBusy}
+        >
           Disconnect
-        </button>
+        </Button>
       </div>
 
-      <button className="button button-ghost" onClick={props.onToggleAdvancedNetworkSettings}>
+      <Button tone="ghost" onClick={props.onToggleAdvancedNetworkSettings}>
         {props.showAdvancedNetworkSettings ? "Hide advanced" : "Show advanced"}
-      </button>
+      </Button>
 
       {props.showAdvancedNetworkSettings && (
         <div className="advanced-settings">
-          <div className="button-row">
-            {(["auto", "local", "vpn"] as const).map((mode) => (
-              <button
-                key={mode}
-                className={`button ${props.connectionMode === mode ? "button-primary" : "button-outline"}`}
-                onClick={() => props.onChangeConnectionMode(mode)}
-              >
-                {mode.toUpperCase()}
-              </button>
-            ))}
-          </div>
           <div className="form-group">
-            <label>Local URL</label>
+            <label>Manual server URL</label>
             <input
               type="text"
-              value={props.localServerBaseUrl}
-              onChange={(e) => props.onChangeLocalServerBaseUrl(e.target.value)}
+              value={props.serverBaseUrl}
+              onChange={(e) => props.onChangeServerBaseUrl(e.target.value)}
               placeholder="http://127.0.0.1:3773"
-            />
-          </div>
-          <div className="form-group">
-            <label>VPN URL</label>
-            <input
-              type="text"
-              value={props.vpnServerBaseUrl}
-              onChange={(e) => props.onChangeVpnServerBaseUrl(e.target.value)}
-              placeholder="http://your-host.ts.net:3773"
+              disabled={props.isBusy || isConnecting}
             />
           </div>
         </div>
       )}
 
-      <button className="button button-danger" onClick={props.onForgetSession}>
+      <Button tone="danger" onClick={props.onForgetSession} disabled={props.isBusy || isConnecting}>
         Forget saved session
-      </button>
-    </div>
+      </Button>
+    </Card>
   );
 }
 
@@ -315,7 +359,7 @@ interface SessionCardProps {
 
 function SessionCard({ session, statusLabel }: SessionCardProps) {
   return (
-    <div className="card session-card">
+    <Card className="session-card">
       <div className="session-card-header">
         <div className="session-identity">
           <div className="avatar">{toInitials(session.projectTitle)}</div>
@@ -324,9 +368,7 @@ function SessionCard({ session, statusLabel }: SessionCardProps) {
             <span className="session-project">{session.projectTitle}</span>
           </div>
         </div>
-        <span className={`status-chip status-${toStatusChipColor(session.status)}`}>
-          {statusLabel}
-        </span>
+        <StatusPill tone={toStatusChipColor(session.status)} label={statusLabel} />
       </div>
       <p className="session-preview">{session.lastMessagePreview}</p>
       {session.lastError && <p className="error-text">{session.lastError}</p>}
@@ -334,6 +376,6 @@ function SessionCard({ session, statusLabel }: SessionCardProps) {
         <span className="text-muted">{formatUpdatedAtLabel(session.updatedAt)}</span>
         <span className="provider-badge">{session.providerName}</span>
       </div>
-    </div>
+    </Card>
   );
 }

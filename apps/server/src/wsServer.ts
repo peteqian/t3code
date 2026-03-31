@@ -256,12 +256,12 @@ function stripRequestTag<T extends { _tag: string }>(body: T) {
 const encodeWsResponse = Schema.encodeEffect(Schema.fromJsonString(WsResponse));
 const decodeWebSocketRequest = decodeJsonResult(WebSocketRequest);
 
-const MOBILE_PAIRING_CREATE_ROUTE = "/api/mobile/pairing/create";
-const MOBILE_PAIRING_EXCHANGE_ROUTE = "/api/mobile/pairing/exchange";
+const MOBILE_ACCESS_REQUEST_CREATE_ROUTE = "/api/mobile/access/request";
+const MOBILE_ACCESS_REQUEST_STATUS_ROUTE = "/api/mobile/access/status";
 const MOBILE_TOKEN_REFRESH_ROUTE = "/api/mobile/token/refresh";
 const isMobileRoute = (pathname: string) =>
-  pathname === MOBILE_PAIRING_CREATE_ROUTE ||
-  pathname === MOBILE_PAIRING_EXCHANGE_ROUTE ||
+  pathname === MOBILE_ACCESS_REQUEST_CREATE_ROUTE ||
+  pathname === MOBILE_ACCESS_REQUEST_STATUS_ROUTE ||
   pathname === MOBILE_TOKEN_REFRESH_ROUTE;
 const CONNECTION_CONTEXT_SYMBOL = Symbol("t3.connection-context");
 
@@ -368,6 +368,11 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
     logOutgoingPush,
   });
   yield* readiness.markPushBusReady;
+
+  const publishMobileAccessRequests = Effect.gen(function* () {
+    const requests = yield* mobileSessionManager.listAccessRequests();
+    return yield* pushBus.publishAll(WS_CHANNELS.serverMobileAccessRequests, requests);
+  });
 
   const publishMobilePresence = Effect.gen(function* () {
     const contexts = yield* Ref.get(clientContexts);
@@ -543,11 +548,19 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         const addCorsHeaders = (headers: Record<string, string>) => {
           if (isMobileRoute(url.pathname)) {
             headers["Access-Control-Allow-Origin"] = "*";
+            headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
+            headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+            headers["Access-Control-Max-Age"] = "600";
           }
           return headers;
         };
 
-        if (url.pathname === MOBILE_PAIRING_CREATE_ROUTE && req.method === "POST") {
+        if (isMobileRoute(url.pathname) && req.method === "OPTIONS") {
+          respond(204, addCorsHeaders({}), "");
+          return;
+        }
+
+        if (url.pathname === MOBILE_ACCESS_REQUEST_CREATE_ROUTE && req.method === "POST") {
           if (authToken) {
             const bearerToken = readBearerToken(req);
             if (bearerToken !== authToken) {
@@ -571,6 +584,17 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
             return;
           }
 
+          const deviceName =
+            typeof requestBody.deviceName === "string" ? requestBody.deviceName.trim() : "";
+          if (!deviceName) {
+            respond(
+              400,
+              addCorsHeaders({ "Content-Type": "application/json" }),
+              JSON.stringify({ error: "deviceName is required." }),
+            );
+            return;
+          }
+
           const ttlSecondsValue = requestBody.ttlSeconds;
           const ttlSeconds =
             typeof ttlSecondsValue === "number" && Number.isInteger(ttlSecondsValue)
@@ -588,9 +612,11 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
             return;
           }
 
-          const result = yield* mobileSessionManager.createPairingSecret(
-            ttlSeconds === undefined ? undefined : { ttlSeconds },
-          );
+          const result = yield* mobileSessionManager.createAccessRequest({
+            deviceName,
+            ttlSeconds,
+          });
+          yield* publishMobileAccessRequests;
           respond(
             200,
             addCorsHeaders({ "Content-Type": "application/json" }),
@@ -599,35 +625,20 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           return;
         }
 
-        if (url.pathname === MOBILE_PAIRING_EXCHANGE_ROUTE && req.method === "POST") {
+        if (url.pathname === MOBILE_ACCESS_REQUEST_STATUS_ROUTE && req.method === "POST") {
           const bodyText = yield* Effect.promise(() => readRequestBody(req)).pipe(
             Effect.mapError(
               () => new RouteRequestError({ message: "Failed to read request body." }),
             ),
           );
           const requestBody = parseJsonObject(bodyText);
-          const pairingCode =
-            typeof requestBody?.pairingCode === "string" ? requestBody.pairingCode.trim() : "";
-          const deviceName =
-            typeof requestBody?.deviceName === "string" ? requestBody.deviceName.trim() : "";
-          if (!pairingCode || !deviceName) {
+          const requestId =
+            typeof requestBody?.requestId === "string" ? requestBody.requestId.trim() : "";
+          if (!requestId) {
             respond(
               400,
               addCorsHeaders({ "Content-Type": "application/json" }),
-              JSON.stringify({ error: "pairingCode and deviceName are required." }),
-            );
-            return;
-          }
-
-          const exchangeResult = yield* mobileSessionManager
-            .exchangePairingSecret({ pairingCode, deviceName })
-            .pipe(Effect.exit);
-
-          if (Exit.isFailure(exchangeResult)) {
-            respond(
-              401,
-              addCorsHeaders({ "Content-Type": "application/json" }),
-              JSON.stringify({ error: Cause.pretty(exchangeResult.cause) }),
+              JSON.stringify({ error: "requestId is required." }),
             );
             return;
           }
@@ -635,7 +646,7 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           respond(
             200,
             addCorsHeaders({ "Content-Type": "application/json" }),
-            JSON.stringify(exchangeResult.value),
+            JSON.stringify(yield* mobileSessionManager.getAccessRequestStatus({ requestId })),
           );
           return;
         }
@@ -1167,11 +1178,21 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
         return { keybindings: keybindingsConfig, issues: [] };
       }
 
-      case WS_METHODS.serverCreateMobilePairing: {
+      case WS_METHODS.serverListMobileAccessRequests:
+        return yield* mobileSessionManager.listAccessRequests();
+
+      case WS_METHODS.serverApproveMobileAccessRequest: {
         const body = stripRequestTag(request.body);
-        return yield* mobileSessionManager.createPairingSecret(
-          body.ttlSeconds === undefined ? undefined : { ttlSeconds: body.ttlSeconds },
-        );
+        const result = yield* mobileSessionManager.approveAccessRequest(body.requestId);
+        yield* publishMobileAccessRequests;
+        return result;
+      }
+
+      case WS_METHODS.serverRejectMobileAccessRequest: {
+        const body = stripRequestTag(request.body);
+        const result = yield* mobileSessionManager.rejectAccessRequest(body.requestId);
+        yield* publishMobileAccessRequests;
+        return result;
       }
 
       case WS_METHODS.serverListMobileDevices:

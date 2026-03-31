@@ -28,6 +28,7 @@
     "dev:marketing": "turbo run dev --filter=@t3tools/marketing",
     "dev:mobile": "turbo run dev --filter=@t3tools/mobile",
     "dev:mobile:ios": "node scripts/dev-mobile-ios.ts",
+    "dev:lan": "node scripts/dev-runner.ts dev --host=0.0.0.0",
     "dev:desktop": "node scripts/dev-runner.ts dev:desktop",
     "start": "turbo run start --filter=t3",
     "start:desktop": "turbo run start --filter=@t3tools/desktop",

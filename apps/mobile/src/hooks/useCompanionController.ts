@@ -4,23 +4,22 @@ import type {
   OrchestrationReadModel,
   OrchestrationSessionStatus,
 } from "@t3tools/contracts";
+import type { StatusTone } from "@t3tools/ui";
 import {
   buildWebSocketUrl,
   clearSession,
-  describeConnectionTarget,
-  executeWithConnectionCandidates,
-  exchangePairingCode,
+  getAccessRequest,
   loadSession,
   loadSettings,
+  requestAccess,
   refreshSessionToken,
-  resolveConnectionCandidates,
   saveSession,
   saveSettings,
-  type MobileConnectionCandidate,
-  type MobileConnectionMode,
-  type MobileConnectionTarget,
+  type MobileAccessRequestState,
   type MobileSessionBundle,
 } from "../lib/mobilePairing";
+import { scanServers } from "../lib/mobileDiscovery";
+import type { MobileDiscoveredServer } from "@t3tools/contracts";
 
 interface ServerWelcomePushPayload {
   readonly connectionKind?: "desktop" | "mobile" | "anonymous";
@@ -61,6 +60,7 @@ const ORCHESTRATION_GET_SNAPSHOT_METHOD = "orchestration.getSnapshot";
 const ORCHESTRATION_DISPATCH_COMMAND_METHOD = "orchestration.dispatchCommand";
 const ORCHESTRATION_DOMAIN_EVENT_CHANNEL = "orchestration.domainEvent";
 const SERVER_WELCOME_CHANNEL = "server.welcome";
+const DEFAULT_LOCAL_SERVER_URL = "http://127.0.0.1:3773";
 
 function createEntityId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
@@ -72,21 +72,34 @@ function toThreadTitle(prompt: string): string {
   return normalized.slice(0, 72);
 }
 
+function pickNewestItem<Value extends { readonly updatedAt: string }>(
+  values: readonly Value[],
+): Value | null {
+  let newest: Value | null = null;
+
+  for (const value of values) {
+    if (!newest || value.updatedAt.localeCompare(newest.updatedAt) > 0) {
+      newest = value;
+    }
+  }
+
+  return newest;
+}
+
 function pickProjectForPrompt(readModel: OrchestrationReadModel) {
   const activeProjects = readModel.projects.filter((project) => project.deletedAt === null);
-  return (
-    [...activeProjects].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0] ??
-    null
-  );
+  return pickNewestItem(activeProjects);
 }
 
 function resolvePromptModelSelection(
   readModel: OrchestrationReadModel,
   projectId: string,
 ): ModelSelection {
-  const activeThread = readModel.threads
-    .filter((thread) => thread.deletedAt === null && thread.projectId === projectId)
-    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+  const activeThread = pickNewestItem(
+    readModel.threads.filter(
+      (thread) => thread.deletedAt === null && thread.projectId === projectId,
+    ),
+  );
 
   if (activeThread) return activeThread.modelSelection;
 
@@ -111,6 +124,20 @@ function resolveConnectedIdentity(payload: ServerWelcomePushPayload | undefined)
   return kind ?? "unknown";
 }
 
+function isLoopbackServerBaseUrl(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return true;
+  }
+
+  return (
+    trimmed.startsWith("http://127.0.0.1") ||
+    trimmed.startsWith("https://127.0.0.1") ||
+    trimmed.startsWith("http://localhost") ||
+    trimmed.startsWith("https://localhost")
+  );
+}
+
 export function formatSessionStatus(status: OrchestrationSessionStatus | "inactive"): string {
   switch (status) {
     case "running":
@@ -132,7 +159,7 @@ export function formatSessionStatus(status: OrchestrationSessionStatus | "inacti
   }
 }
 
-export function toStatusChipColor(status: OrchestrationSessionStatus | "inactive"): string {
+export function toStatusChipColor(status: OrchestrationSessionStatus | "inactive"): StatusTone {
   if (status === "running" || status === "starting") return "accent";
   if (status === "ready") return "success";
   if (status === "interrupted") return "warning";
@@ -145,61 +172,72 @@ function toSessionSummaries(readModel: OrchestrationReadModel): SessionSummary[]
     readModel.projects.map((project) => [project.id, project.title]),
   );
 
-  return (
-    readModel.threads
-      .filter((thread) => thread.deletedAt === null)
-      .map((thread) => {
-        const lastMessage = thread.messages[thread.messages.length - 1];
-        const preview = lastMessage?.text?.trim() ?? "";
-        return {
-          id: thread.id,
-          title: thread.title,
-          projectTitle: projectTitleById.get(thread.projectId) ?? "Unknown project",
-          status: (thread.session?.status ?? "inactive") as SessionSummary["status"],
-          providerName: thread.session?.providerName ?? "none",
-          updatedAt: thread.updatedAt,
-          lastMessagePreview: preview.length > 0 ? preview : "(no messages yet)",
-          lastError: thread.session?.lastError ?? null,
-        };
-      }) as SessionSummary[]
-  ).sort((left, right) => {
-    const byUpdatedAt = right.updatedAt.localeCompare(left.updatedAt);
-    if (byUpdatedAt !== 0) return byUpdatedAt;
-    return left.id.localeCompare(right.id);
-  });
+  const summaries: SessionSummary[] = [];
+
+  for (const thread of readModel.threads) {
+    if (thread.deletedAt !== null) {
+      continue;
+    }
+
+    const lastMessage = thread.messages[thread.messages.length - 1];
+    const preview = lastMessage?.text?.trim() ?? "";
+    const summary: SessionSummary = {
+      id: thread.id,
+      title: thread.title,
+      projectTitle: projectTitleById.get(thread.projectId) ?? "Unknown project",
+      status: (thread.session?.status ?? "inactive") as SessionSummary["status"],
+      providerName: thread.session?.providerName ?? "none",
+      updatedAt: thread.updatedAt,
+      lastMessagePreview: preview.length > 0 ? preview : "(no messages yet)",
+      lastError: thread.session?.lastError ?? null,
+    };
+
+    let insertIndex = summaries.length;
+    for (let index = 0; index < summaries.length; index += 1) {
+      const current = summaries[index];
+      const byUpdatedAt = summary.updatedAt.localeCompare(current.updatedAt);
+      if (byUpdatedAt > 0 || (byUpdatedAt === 0 && summary.id.localeCompare(current.id) < 0)) {
+        insertIndex = index;
+        break;
+      }
+    }
+
+    summaries.splice(insertIndex, 0, summary);
+  }
+
+  return summaries;
 }
 
 export function useCompanionController() {
   const [hasLoadedPersistedState, setHasLoadedPersistedState] = useState(false);
-  const [connectionMode, setConnectionMode] = useState<MobileConnectionMode>("auto");
-  const [localServerBaseUrl, setLocalServerBaseUrl] = useState("http://127.0.0.1:3773");
-  const [vpnServerBaseUrl, setVpnServerBaseUrl] = useState("http://your-host.ts.net:3773");
+  const [serverBaseUrl, setServerBaseUrl] = useState(DEFAULT_LOCAL_SERVER_URL);
   const [deviceName, setDeviceName] = useState("Mobile Device");
-  const [pairingCode, setPairingCode] = useState("");
+  const [accessRequest, setAccessRequest] = useState<MobileAccessRequestState | null>(null);
   const [sessionBundle, setSessionBundle] = useState<MobileSessionBundle | null>(null);
   const [socketState, setSocketState] = useState<
     "disconnected" | "connecting" | "connected" | "error"
   >("disconnected");
-  const [activeEndpointTarget, setActiveEndpointTarget] = useState<MobileConnectionTarget | null>(
-    null,
-  );
   const [statusMessage, setStatusMessage] = useState("");
   const [showAdvancedNetworkSettings, setShowAdvancedNetworkSettings] = useState(false);
   const [lastPushChannel, setLastPushChannel] = useState<string | null>(null);
   const [connectedIdentity, setConnectedIdentity] = useState<string>("unknown");
+  const [discoveredServers, setDiscoveredServers] = useState<ReadonlyArray<MobileDiscoveredServer>>(
+    [],
+  );
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false);
+  const [isScanningServers, setIsScanningServers] = useState(false);
   const [isSubmittingPrompt, setIsSubmittingPrompt] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
 
   const socketRef = useRef<WebSocket | null>(null);
   const hasAutoAttemptedRef = useRef(false);
   const handleConnectRef = useRef<() => Promise<void>>(async () => undefined);
-  const handlePairDeviceRef = useRef<() => Promise<void>>(async () => undefined);
   const nextRequestIdRef = useRef(1);
   const pendingRequestsRef = useRef(new Map<string, PendingSocketRequest>());
   const refreshSessionsRef = useRef<() => Promise<void>>(async () => undefined);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectPromiseRef = useRef<Promise<void> | null>(null);
 
   const rejectPendingRequests = useCallback((message: string) => {
     for (const pending of pendingRequestsRef.current.values()) {
@@ -280,9 +318,7 @@ export function useCompanionController() {
     let cancelled = false;
     loadSettings().then((settings) => {
       if (cancelled) return;
-      setConnectionMode(settings.connectionMode);
-      setLocalServerBaseUrl(settings.localServerBaseUrl);
-      setVpnServerBaseUrl(settings.vpnServerBaseUrl);
+      setServerBaseUrl(settings.serverBaseUrl);
       setDeviceName(settings.deviceName);
     });
     loadSession().then((bundle) => {
@@ -299,23 +335,58 @@ export function useCompanionController() {
     };
   }, [rejectPendingRequests]);
 
-  const persistSettingsWithLastKnown = async (_target: MobileConnectionTarget) => {
+  const persistSettings = async () => {
     await saveSettings({
-      connectionMode,
-      localServerBaseUrl,
-      vpnServerBaseUrl,
+      serverBaseUrl,
       deviceName,
     });
   };
 
-  const connectWithSession = async (
-    bundle: MobileSessionBundle,
-    candidate: MobileConnectionCandidate,
-  ) => {
-    return new Promise<void>((resolve, reject) => {
+  const handleScanServers = useCallback(async () => {
+    setIsScanningServers(true);
+
+    try {
+      const servers = await scanServers();
+      setDiscoveredServers(servers);
+
+      if (servers.length > 0 && isLoopbackServerBaseUrl(serverBaseUrl)) {
+        setServerBaseUrl(servers[0]!.baseUrl);
+        setStatusMessage(`Using nearby server ${servers[0]!.baseUrl}`);
+      }
+    } catch (error) {
+      setStatusMessage(toStatusErrorMessage(error));
+    } finally {
+      setIsScanningServers(false);
+    }
+  }, [serverBaseUrl]);
+
+  const connectWithSession = async (bundle: MobileSessionBundle) => {
+    if (connectPromiseRef.current) {
+      return connectPromiseRef.current;
+    }
+
+    setSocketState("connecting");
+
+    const connectPromise = new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      const finishResolve = () => {
+        if (settled) return;
+        settled = true;
+        connectPromiseRef.current = null;
+        resolve();
+      };
+
+      const finishReject = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        connectPromiseRef.current = null;
+        reject(error);
+      };
+
       socketRef.current?.close();
       rejectPendingRequests("Socket restarted.");
-      const wsUrl = buildWebSocketUrl(candidate.serverBaseUrl, bundle.accessToken);
+      const wsUrl = buildWebSocketUrl(serverBaseUrl, bundle.accessToken);
       const socket = new WebSocket(wsUrl);
       socketRef.current = socket;
 
@@ -353,14 +424,16 @@ export function useCompanionController() {
         rejectPendingRequests("Socket closed.");
         setSocketState("disconnected");
         setStatusMessage("Socket disconnected. Tap Connect to retry.");
+        if (!settled) {
+          finishReject(new Error("WebSocket closed before it connected."));
+        }
       });
 
       socket.addEventListener("open", () => {
         setSocketState("connected");
-        setActiveEndpointTarget(candidate.target);
-        setStatusMessage(`Connected via ${describeConnectionTarget(candidate.target)}.`);
+        setStatusMessage("Connected.");
         void refreshSessionsRef.current();
-        resolve();
+        finishResolve();
       });
 
       socket.addEventListener("error", () => {
@@ -368,58 +441,65 @@ export function useCompanionController() {
           setSocketState("error");
         }
         rejectPendingRequests("Socket failed to connect.");
-        reject(new Error("WebSocket failed. Check server URL, token, and reachability."));
+        finishReject(new Error("WebSocket failed. Check server URL, token, and reachability."));
       });
     });
+
+    connectPromiseRef.current = connectPromise;
+    return connectPromise;
   };
 
-  const handlePairDevice = async () => {
-    console.log("[PAIR] Starting pair device...");
-    console.log("[PAIR] Device name:", deviceName);
-    console.log("[PAIR] Connection mode:", connectionMode);
-    console.log("[PAIR] Local URL:", localServerBaseUrl);
-    console.log("[PAIR] VPN URL:", vpnServerBaseUrl);
+  const waitForApproval = useCallback(
+    async (requestId: string): Promise<MobileSessionBundle> => {
+      const startedAt = Date.now();
 
-    const trimmedCode = pairingCode.trim();
-    if (!trimmedCode) {
-      console.log("[PAIR] Error: No pairing code");
-      setStatusMessage("Enter a pairing code first.");
-      return;
-    }
+      while (Date.now() - startedAt < 120_000) {
+        const current = await getAccessRequest(serverBaseUrl, requestId);
+        setAccessRequest(current);
+
+        if (current.status === "approved" && current.session) {
+          return current.session;
+        }
+
+        if (current.status === "rejected") {
+          throw new Error("Access request was rejected on your Mac.");
+        }
+
+        if (current.status === "expired") {
+          throw new Error("Access request expired before it was approved.");
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+      }
+
+      throw new Error("Access approval timed out.");
+    },
+    [serverBaseUrl],
+  );
+
+  const handleRequestAccess = async () => {
     if (!deviceName.trim()) {
-      console.log("[PAIR] Error: No device name");
       setStatusMessage("Enter a device name first.");
       return;
     }
 
     setIsBusy(true);
     try {
-      const candidates = resolveConnectionCandidates(
-        connectionMode,
-        localServerBaseUrl,
-        vpnServerBaseUrl,
-        null,
-      );
-      console.log("[PAIR] Candidates:", candidates);
-
-      if (candidates.length === 0) {
-        throw new Error("Configure at least one server URL (Local or VPN).");
+      if (!serverBaseUrl.trim()) {
+        throw new Error("Enter a server URL first.");
       }
 
-      console.log("[PAIR] Attempting to exchange pairing code...");
-      const { candidate, result: bundle } = await executeWithConnectionCandidates(candidates, (c) =>
-        exchangePairingCode(c.serverBaseUrl, deviceName, trimmedCode),
-      );
-
-      console.log("[PAIR] Success! Saving session...");
+      const pendingRequest = await requestAccess(serverBaseUrl, deviceName);
+      setAccessRequest(pendingRequest);
+      setStatusMessage("Waiting for approval on your Mac...");
+      const bundle = await waitForApproval(pendingRequest.requestId);
       await saveSession(bundle);
-      await persistSettingsWithLastKnown(candidate.target);
+      await persistSettings();
       setSessionBundle(bundle);
-      setPairingCode("");
+      setAccessRequest(null);
       setStatusMessage("Paired successfully. Connecting...");
-      await connectWithSession(bundle, candidate);
+      await connectWithSession(bundle);
     } catch (error) {
-      console.error("[PAIR] Error:", error);
       setStatusMessage(toStatusErrorMessage(error));
       setSocketState("error");
     } finally {
@@ -427,37 +507,32 @@ export function useCompanionController() {
     }
   };
 
-  handlePairDeviceRef.current = handlePairDevice;
-
   const handleConnect = async () => {
+    if (socketState === "connecting") {
+      return connectPromiseRef.current ?? Promise.resolve();
+    }
+
+    if (socketState === "connected" && socketRef.current?.readyState === WebSocket.OPEN) {
+      setStatusMessage("Already connected.");
+      return;
+    }
+
     if (!sessionBundle) {
-      setStatusMessage("Pair first to obtain session credentials.");
+      setStatusMessage("Request access first to obtain session credentials.");
       return;
     }
 
     setIsBusy(true);
     try {
-      const candidates = resolveConnectionCandidates(
-        connectionMode,
-        localServerBaseUrl,
-        vpnServerBaseUrl,
-        activeEndpointTarget,
-      );
-      if (candidates.length === 0) {
-        throw new Error("Configure at least one server URL (Local or VPN).");
+      if (!serverBaseUrl.trim()) {
+        throw new Error("Enter a server URL first.");
       }
 
-      let activeBundle = sessionBundle;
-      await executeWithConnectionCandidates(candidates, async (c) => {
-        const refreshed = await refreshSessionToken(c.serverBaseUrl, activeBundle.refreshToken);
-        activeBundle = refreshed;
-        await saveSession(refreshed);
-        setSessionBundle(refreshed);
-      });
-
-      const target = activeEndpointTarget ?? candidates[0]?.target ?? "local";
-      await persistSettingsWithLastKnown(target);
-      await connectWithSession(activeBundle, candidates[0]!);
+      const refreshed = await refreshSessionToken(serverBaseUrl, sessionBundle.refreshToken);
+      await saveSession(refreshed);
+      setSessionBundle(refreshed);
+      await persistSettings();
+      await connectWithSession(refreshed);
     } catch (error) {
       setStatusMessage(toStatusErrorMessage(error));
       setSocketState("error");
@@ -469,11 +544,11 @@ export function useCompanionController() {
   handleConnectRef.current = handleConnect;
 
   const handleDisconnect = () => {
+    connectPromiseRef.current = null;
     socketRef.current?.close();
     socketRef.current = null;
     rejectPendingRequests("Socket disconnected.");
     setSocketState("disconnected");
-    setActiveEndpointTarget(null);
     setConnectedIdentity("unknown");
     setSessions([]);
     setStatusMessage("Disconnected.");
@@ -481,12 +556,13 @@ export function useCompanionController() {
 
   const handleForgetSession = async () => {
     await clearSession();
+    connectPromiseRef.current = null;
     socketRef.current?.close();
     socketRef.current = null;
     rejectPendingRequests("Session forgotten.");
     setSessionBundle(null);
+    setAccessRequest(null);
     setSocketState("disconnected");
-    setActiveEndpointTarget(null);
     setConnectedIdentity("unknown");
     setLastPushChannel(null);
     setSessions([]);
@@ -577,38 +653,34 @@ export function useCompanionController() {
       void handleConnectRef.current();
       return;
     }
-    if (pairingCode.trim().length > 0) {
-      hasAutoAttemptedRef.current = true;
-      setStatusMessage("Pairing with saved code...");
-      void handlePairDeviceRef.current();
-    }
-  }, [hasLoadedPersistedState, isBusy, pairingCode, sessionBundle]);
+  }, [hasLoadedPersistedState, isBusy, sessionBundle]);
+
+  useEffect(() => {
+    void handleScanServers();
+  }, [handleScanServers]);
 
   return {
-    connectionMode,
-    localServerBaseUrl,
-    vpnServerBaseUrl,
+    serverBaseUrl,
     deviceName,
-    activeEndpointTarget,
-    pairingCode,
+    accessRequest,
     sessionBundle,
     socketState,
     statusMessage,
     showAdvancedNetworkSettings,
     lastPushChannel,
     connectedIdentity,
+    discoveredServers,
     sessions,
     isRefreshingSessions,
+    isScanningServers,
     isSubmittingPrompt,
     formatSessionStatus,
     isBusy,
-    setConnectionMode,
-    setLocalServerBaseUrl,
-    setVpnServerBaseUrl,
+    setServerBaseUrl,
     setDeviceName,
-    setPairingCode,
     setShowAdvancedNetworkSettings,
-    handlePairDevice,
+    handleScanServers,
+    handleRequestAccess,
     handleConnect,
     handleDisconnect,
     handleForgetSession,

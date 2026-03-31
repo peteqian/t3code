@@ -1,6 +1,7 @@
 /* T3 Companion - Mobile App Styles (matching web theme) */
 
 @import "./styles/theme.css";
+@import "@t3tools/ui/styles.css";
 
 * {
   margin: 0;
@@ -65,41 +66,6 @@
   background: var(--secondary);
 }
 
-/* Status Chips */
-.status-chip {
-  font-size: 11px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 9999px;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-}
-
-.status-success {
-  background: rgba(16, 185, 129, 0.15);
-  color: var(--success);
-}
-
-.status-accent {
-  background: rgba(59, 130, 246, 0.15);
-  color: var(--info);
-}
-
-.status-warning {
-  background: rgba(245, 158, 11, 0.15);
-  color: var(--warning);
-}
-
-.status-danger {
-  background: rgba(239, 68, 68, 0.15);
-  color: var(--destructive);
-}
-
-.status-default {
-  background: var(--secondary);
-  color: var(--muted-foreground);
-}
-
 /* Main Content */
 .main-content {
   padding: 16px;
@@ -110,15 +76,7 @@
   margin: 0 auto;
 }
 
-/* Cards */
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 16px;
-}
-
-.card h3 {
+.t3-card h3 {
   margin: 0 0 8px 0;
   font-size: 16px;
   font-weight: 600;
@@ -161,78 +119,6 @@
   display: flex;
   gap: 8px;
   margin-top: 12px;
-}
-
-/* Buttons */
-.button {
-  padding: 8px 16px;
-  border-radius: var(--radius-md);
-  font-size: 14px;
-  font-weight: 500;
-  cursor: pointer;
-  border: 1px solid transparent;
-  transition: all 0.15s ease;
-  font-family: inherit;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-}
-
-.button-primary {
-  background: var(--primary);
-  color: var(--primary-foreground);
-}
-
-.button-primary:hover:not(:disabled) {
-  background: var(--primary);
-  opacity: 0.9;
-}
-
-.button-secondary {
-  background: var(--secondary);
-  color: var(--secondary-foreground);
-  border-color: var(--border);
-}
-
-.button-secondary:hover {
-  background: var(--accent);
-}
-
-.button-outline {
-  background: transparent;
-  color: var(--foreground);
-  border-color: var(--border);
-}
-
-.button-outline:hover {
-  background: var(--secondary);
-}
-
-.button-ghost {
-  background: transparent;
-  color: var(--muted-foreground);
-  border-color: transparent;
-}
-
-.button-ghost:hover {
-  color: var(--foreground);
-  background: var(--secondary);
-}
-
-.button-danger {
-  background: rgba(239, 68, 68, 0.1);
-  color: var(--destructive);
-  border-color: var(--destructive);
-}
-
-.button-danger:hover {
-  background: rgba(239, 68, 68, 0.2);
-}
-
-.button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
 }
 
 .button-row {

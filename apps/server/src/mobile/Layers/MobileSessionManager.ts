@@ -1,8 +1,9 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { randomUUID, createHash, randomBytes } from "node:crypto";
 
 import type {
-  MobilePairingCreateResponse,
-  MobilePairingExchangeResponse,
+  MobileAccessRequestCreateResponse,
+  MobileAccessStatusResponse,
+  MobileTokenBundle,
   MobileTokenRefreshResponse,
 } from "@t3tools/contracts";
 import { Effect, FileSystem, Layer, Path, Ref } from "effect";
@@ -13,10 +14,6 @@ import {
   MobileSessionManager,
   type MobileSessionManagerShape,
 } from "../Services/MobileSessionManager";
-
-interface PairingSecretRecord {
-  readonly expiresAtMs: number;
-}
 
 interface AccessTokenRecord {
   readonly deviceId: string;
@@ -31,8 +28,17 @@ interface PersistedDeviceRecord {
   readonly refreshTokenHash: string;
 }
 
+interface PendingAccessRequestRecord {
+  readonly requestId: string;
+  readonly deviceName: string;
+  readonly createdAt: string;
+  readonly expiresAtMs: number;
+  readonly status: "pending" | "approved" | "rejected";
+  readonly session: MobileTokenBundle | null;
+}
+
 interface MobileSessionState {
-  readonly pairingSecretsByHash: Map<string, PairingSecretRecord>;
+  readonly accessRequestsById: Map<string, PendingAccessRequestRecord>;
   readonly accessTokens: Map<string, AccessTokenRecord>;
   readonly devicesById: Map<string, PersistedDeviceRecord>;
   readonly deviceIdByRefreshTokenHash: Map<string, string>;
@@ -42,54 +48,27 @@ interface PersistedState {
   readonly devices: ReadonlyArray<PersistedDeviceRecord>;
 }
 
-const DEFAULT_PAIRING_TTL_SECONDS = 120;
+const DEFAULT_ACCESS_REQUEST_TTL_SECONDS = 120;
 const ACCESS_TOKEN_TTL_MS = 5 * 60 * 1000;
-const PAIRING_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-const PAIRING_CODE_LENGTH = 8;
 
-/**
- * Hashes a secret token for at-rest storage and lookups.
- */
 function hashSecret(secret: string): string {
   return createHash("sha256").update(secret).digest("hex");
 }
 
-/**
- * Creates a random token suitable for URL/query transport.
- */
 function createToken(): string {
   return randomBytes(24).toString("base64url");
 }
 
-function normalizePairingCode(pairingCode: string): string {
-  return pairingCode.trim().toUpperCase();
+function toIsoDateTime(valueMs: number): string {
+  return new Date(valueMs).toISOString();
 }
 
-function createPairingCode(): string {
-  const bytes = randomBytes(PAIRING_CODE_LENGTH);
-  let code = "";
-  for (let index = 0; index < PAIRING_CODE_LENGTH; index += 1) {
-    code += PAIRING_CODE_ALPHABET[bytes[index]! % PAIRING_CODE_ALPHABET.length];
-  }
-  return code;
-}
-
-/**
- * Creates an ISO expiration timestamp from milliseconds.
- */
-function toIsoDateTime(expiresAtMs: number): string {
-  return new Date(expiresAtMs).toISOString();
-}
-
-/**
- * Creates the token response payload consumed by mobile clients.
- */
-function createTokenResponse(input: {
+function createSessionBundle(input: {
   readonly deviceId: string;
   readonly accessToken: string;
   readonly accessTokenExpiresAtMs: number;
   readonly refreshToken: string;
-}): MobilePairingExchangeResponse {
+}): MobileTokenBundle {
   return {
     deviceId: input.deviceId,
     accessToken: input.accessToken,
@@ -98,15 +77,12 @@ function createTokenResponse(input: {
   };
 }
 
-/**
- * Reads persisted mobile device records from disk.
- */
 const loadPersistedState = Effect.fn(function* (sessionsFilePath: string) {
   const fs = yield* FileSystem.FileSystem;
   const raw = yield* fs
     .readFileString(sessionsFilePath)
     .pipe(Effect.catch(() => Effect.succeed("")));
-  if (raw.trim().length === 0) {
+  if (raw.trim().length <= 0) {
     return { devices: [] } satisfies PersistedState;
   }
 
@@ -130,9 +106,6 @@ const loadPersistedState = Effect.fn(function* (sessionsFilePath: string) {
   } satisfies PersistedState;
 });
 
-/**
- * Persists mobile device records to disk.
- */
 const persistState = Effect.fn(function* (
   sessionsFilePath: string,
   devicesById: Map<string, PersistedDeviceRecord>,
@@ -143,6 +116,17 @@ const persistState = Effect.fn(function* (
   };
   yield* fs.writeFileString(sessionsFilePath, JSON.stringify(payload, null, 2));
 });
+
+function pruneAccessRequests(
+  accessRequestsById: Map<string, PendingAccessRequestRecord>,
+  now: number,
+): void {
+  for (const [requestId, request] of accessRequestsById.entries()) {
+    if (request.expiresAtMs <= now) {
+      accessRequestsById.delete(requestId);
+    }
+  }
+}
 
 export const MobileSessionManagerLive = Layer.effect(
   MobileSessionManager,
@@ -156,7 +140,7 @@ export const MobileSessionManagerLive = Layer.effect(
     );
 
     const state = yield* Ref.make<MobileSessionState>({
-      pairingSecretsByHash: new Map(),
+      accessRequestsById: new Map(),
       accessTokens: new Map(),
       devicesById: new Map(persisted.devices.map((device) => [device.id, device])),
       deviceIdByRefreshTokenHash: new Map(
@@ -175,38 +159,95 @@ export const MobileSessionManagerLive = Layer.effect(
         ),
       );
 
-    const createPairingSecret: MobileSessionManagerShape["createPairingSecret"] = (input) =>
+    const createAccessRequest: MobileSessionManagerShape["createAccessRequest"] = (input) =>
       Ref.modify(state, (current) => {
+        const now = Date.now();
+        pruneAccessRequests(current.accessRequestsById, now);
+
         const ttlSeconds = Math.max(
           30,
-          Math.min(300, input?.ttlSeconds ?? DEFAULT_PAIRING_TTL_SECONDS),
+          Math.min(300, input.ttlSeconds ?? DEFAULT_ACCESS_REQUEST_TTL_SECONDS),
         );
-        const pairingCode = createPairingCode();
-        const pairingCodeHash = hashSecret(normalizePairingCode(pairingCode));
-        const expiresAtMs = Date.now() + ttlSeconds * 1000;
-        current.pairingSecretsByHash.set(pairingCodeHash, { expiresAtMs });
+        const requestId = randomUUID();
+        const createdAt = new Date(now).toISOString();
+        const expiresAtMs = now + ttlSeconds * 1000;
+        current.accessRequestsById.set(requestId, {
+          requestId,
+          deviceName: input.deviceName,
+          createdAt,
+          expiresAtMs,
+          status: "pending",
+          session: null,
+        });
+
         return [
           {
-            pairingCode,
+            requestId,
+            status: "pending",
+            createdAt,
             expiresAt: toIsoDateTime(expiresAtMs),
-          } satisfies MobilePairingCreateResponse,
+          } satisfies MobileAccessRequestCreateResponse,
           current,
         ] as const;
       });
 
-    const exchangePairingSecret: MobileSessionManagerShape["exchangePairingSecret"] = (input) =>
-      Effect.gen(function* () {
-        const pairingCodeHash = hashSecret(normalizePairingCode(input.pairingCode));
+    const getAccessRequestStatus: MobileSessionManagerShape["getAccessRequestStatus"] = (input) =>
+      Ref.modify(state, (current): readonly [MobileAccessStatusResponse, MobileSessionState] => {
         const now = Date.now();
+        pruneAccessRequests(current.accessRequestsById, now);
 
-        const result = yield* Ref.modify(state, (current) => {
-          const pairingRecord = current.pairingSecretsByHash.get(pairingCodeHash);
-          if (!pairingRecord || pairingRecord.expiresAtMs <= now) {
-            current.pairingSecretsByHash.delete(pairingCodeHash);
-            return [null as MobilePairingExchangeResponse | null, current] as const;
+        const request = current.accessRequestsById.get(input.requestId);
+        if (!request) {
+          return [
+            {
+              status: "expired",
+              expiresAt: new Date(now).toISOString(),
+            } satisfies MobileAccessStatusResponse,
+            current,
+          ] as const;
+        }
+
+        return [
+          {
+            status: request.status,
+            expiresAt: toIsoDateTime(request.expiresAtMs),
+            session: request.session ?? undefined,
+          } satisfies MobileAccessStatusResponse,
+          current,
+        ] as const;
+      });
+
+    const listAccessRequests: MobileSessionManagerShape["listAccessRequests"] = () =>
+      Ref.modify(state, (current) => {
+        const now = Date.now();
+        pruneAccessRequests(current.accessRequestsById, now);
+
+        return [
+          {
+            requests: Array.from(current.accessRequestsById.values())
+              .filter((request) => request.status === "pending")
+              .map((request) => ({
+                requestId: request.requestId,
+                deviceName: request.deviceName,
+                createdAt: request.createdAt,
+                expiresAt: toIsoDateTime(request.expiresAtMs),
+              }))
+              .toSorted((left, right) => right.createdAt.localeCompare(left.createdAt)),
+          },
+          current,
+        ] as const;
+      });
+
+    const approveAccessRequest: MobileSessionManagerShape["approveAccessRequest"] = (requestId) =>
+      Effect.gen(function* () {
+        const now = Date.now();
+        const approved = yield* Ref.modify(state, (current) => {
+          pruneAccessRequests(current.accessRequestsById, now);
+
+          const request = current.accessRequestsById.get(requestId);
+          if (!request || request.status !== "pending") {
+            return [false, current] as const;
           }
-
-          current.pairingSecretsByHash.delete(pairingCodeHash);
 
           const deviceId = randomUUID();
           const refreshToken = createToken();
@@ -217,7 +258,7 @@ export const MobileSessionManagerLive = Layer.effect(
 
           current.devicesById.set(deviceId, {
             id: deviceId,
-            deviceName: input.deviceName,
+            deviceName: request.deviceName,
             createdAt: nowIso,
             updatedAt: nowIso,
             refreshTokenHash,
@@ -227,28 +268,47 @@ export const MobileSessionManagerLive = Layer.effect(
             deviceId,
             expiresAtMs: accessTokenExpiresAtMs,
           });
-
-          return [
-            createTokenResponse({
+          current.accessRequestsById.set(requestId, {
+            ...request,
+            status: "approved",
+            session: createSessionBundle({
               deviceId,
               accessToken,
               accessTokenExpiresAtMs,
               refreshToken,
             }),
-            current,
-          ] as const;
+          });
+
+          return [true, current] as const;
         });
 
-        if (!result) {
+        if (!approved) {
           return yield* new MobileSessionError({
-            message: "Pairing code is invalid or expired.",
+            message: "Access request is missing or already handled.",
           });
         }
 
         const current = yield* Ref.get(state);
         yield* persistDevices(current.devicesById);
-        return result;
+        return { approved: true };
       });
+
+    const rejectAccessRequest: MobileSessionManagerShape["rejectAccessRequest"] = (requestId) =>
+      Ref.modify(state, (current) => {
+        const now = Date.now();
+        pruneAccessRequests(current.accessRequestsById, now);
+
+        const request = current.accessRequestsById.get(requestId);
+        if (!request || request.status !== "pending") {
+          return [false, current] as const;
+        }
+
+        current.accessRequestsById.set(requestId, {
+          ...request,
+          status: "rejected",
+        });
+        return [true, current] as const;
+      }).pipe(Effect.map((rejected) => ({ rejected })));
 
     const refreshAccessToken: MobileSessionManagerShape["refreshAccessToken"] = (input) =>
       Effect.gen(function* () {
@@ -260,8 +320,8 @@ export const MobileSessionManagerLive = Layer.effect(
           if (!deviceId) {
             return [null as MobileTokenRefreshResponse | null, current] as const;
           }
-          const device = current.devicesById.get(deviceId);
 
+          const device = current.devicesById.get(deviceId);
           if (!device) {
             current.deviceIdByRefreshTokenHash.delete(refreshTokenHash);
             return [null as MobileTokenRefreshResponse | null, current] as const;
@@ -284,7 +344,7 @@ export const MobileSessionManagerLive = Layer.effect(
           });
 
           return [
-            createTokenResponse({
+            createSessionBundle({
               deviceId: device.id,
               accessToken,
               accessTokenExpiresAtMs,
@@ -314,11 +374,6 @@ export const MobileSessionManagerLive = Layer.effect(
 
         const now = Date.now();
         if (token.expiresAtMs <= now) {
-          current.accessTokens.delete(accessToken);
-          return [null, current] as const;
-        }
-
-        if (!current.devicesById.has(token.deviceId)) {
           current.accessTokens.delete(accessToken);
           return [null, current] as const;
         }
@@ -365,6 +420,7 @@ export const MobileSessionManagerLive = Layer.effect(
               current.accessTokens.delete(token);
             }
           }
+
           return [true, current] as const;
         });
 
@@ -377,8 +433,11 @@ export const MobileSessionManagerLive = Layer.effect(
       });
 
     return {
-      createPairingSecret,
-      exchangePairingSecret,
+      createAccessRequest,
+      getAccessRequestStatus,
+      listAccessRequests,
+      approveAccessRequest,
+      rejectAccessRequest,
       refreshAccessToken,
       validateAccessToken,
       listDevices,

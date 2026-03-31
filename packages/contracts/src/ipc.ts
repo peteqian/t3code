@@ -51,9 +51,13 @@ import type {
   OrchestrationReadModel,
 } from "./orchestration";
 import { EditorId } from "./editor";
-import type { MobilePairingCreateRequest, MobilePairingCreateResponse } from "./mobileCompanion";
 import type {
+  MobileApproveAccessRequestRequest,
+  MobileApproveAccessRequestResponse,
+  MobileListAccessRequestsResponse,
   MobileListDevicesResponse,
+  MobileRejectAccessRequestRequest,
+  MobileRejectAccessRequestResponse,
   MobileRevokeDeviceRequest,
   MobileRevokeDeviceResponse,
 } from "./mobileCompanion";
@@ -173,9 +177,13 @@ export interface NativeApi {
     getConfig: () => Promise<ServerConfig>;
     refreshProviders: () => Promise<ServerProviderUpdatedPayload>;
     upsertKeybinding: (input: ServerUpsertKeybindingInput) => Promise<ServerUpsertKeybindingResult>;
-    createMobilePairing: (
-      input: MobilePairingCreateRequest,
-    ) => Promise<MobilePairingCreateResponse>;
+    listMobileAccessRequests: () => Promise<MobileListAccessRequestsResponse>;
+    approveMobileAccessRequest: (
+      input: MobileApproveAccessRequestRequest,
+    ) => Promise<MobileApproveAccessRequestResponse>;
+    rejectMobileAccessRequest: (
+      input: MobileRejectAccessRequestRequest,
+    ) => Promise<MobileRejectAccessRequestResponse>;
     listMobileDevices: () => Promise<MobileListDevicesResponse>;
     revokeMobileDevice: (input: MobileRevokeDeviceRequest) => Promise<MobileRevokeDeviceResponse>;
     getSettings: () => Promise<ServerSettings>;

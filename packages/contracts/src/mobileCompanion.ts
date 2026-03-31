@@ -1,23 +1,6 @@
 import { Schema } from "effect";
 import { IsoDateTime, TrimmedNonEmptyString } from "./baseSchemas";
 
-export const MobilePairingCreateRequest = Schema.Struct({
-  ttlSeconds: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 30, maximum: 300 }))),
-});
-export type MobilePairingCreateRequest = typeof MobilePairingCreateRequest.Type;
-
-export const MobilePairingCreateResponse = Schema.Struct({
-  pairingCode: TrimmedNonEmptyString,
-  expiresAt: IsoDateTime,
-});
-export type MobilePairingCreateResponse = typeof MobilePairingCreateResponse.Type;
-
-export const MobilePairingExchangeRequest = Schema.Struct({
-  pairingCode: TrimmedNonEmptyString,
-  deviceName: TrimmedNonEmptyString,
-});
-export type MobilePairingExchangeRequest = typeof MobilePairingExchangeRequest.Type;
-
 export const MobileTokenBundle = Schema.Struct({
   deviceId: TrimmedNonEmptyString,
   accessToken: TrimmedNonEmptyString,
@@ -26,8 +9,64 @@ export const MobileTokenBundle = Schema.Struct({
 });
 export type MobileTokenBundle = typeof MobileTokenBundle.Type;
 
-export const MobilePairingExchangeResponse = MobileTokenBundle;
-export type MobilePairingExchangeResponse = typeof MobilePairingExchangeResponse.Type;
+export const MobileAccessRequestCreateRequest = Schema.Struct({
+  deviceName: TrimmedNonEmptyString,
+  ttlSeconds: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 30, maximum: 300 }))),
+});
+export type MobileAccessRequestCreateRequest = typeof MobileAccessRequestCreateRequest.Type;
+
+export const MobileAccessRequestCreateResponse = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+  status: Schema.Literal("pending"),
+  createdAt: IsoDateTime,
+  expiresAt: IsoDateTime,
+});
+export type MobileAccessRequestCreateResponse = typeof MobileAccessRequestCreateResponse.Type;
+
+export const MobileAccessStatusRequest = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+});
+export type MobileAccessStatusRequest = typeof MobileAccessStatusRequest.Type;
+
+export const MobilePendingAccessRequest = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+  deviceName: TrimmedNonEmptyString,
+  createdAt: IsoDateTime,
+  expiresAt: IsoDateTime,
+});
+export type MobilePendingAccessRequest = typeof MobilePendingAccessRequest.Type;
+
+export const MobileListAccessRequestsResponse = Schema.Struct({
+  requests: Schema.Array(MobilePendingAccessRequest),
+});
+export type MobileListAccessRequestsResponse = typeof MobileListAccessRequestsResponse.Type;
+
+export const MobileApproveAccessRequestRequest = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+});
+export type MobileApproveAccessRequestRequest = typeof MobileApproveAccessRequestRequest.Type;
+
+export const MobileApproveAccessRequestResponse = Schema.Struct({
+  approved: Schema.Boolean,
+});
+export type MobileApproveAccessRequestResponse = typeof MobileApproveAccessRequestResponse.Type;
+
+export const MobileRejectAccessRequestRequest = Schema.Struct({
+  requestId: TrimmedNonEmptyString,
+});
+export type MobileRejectAccessRequestRequest = typeof MobileRejectAccessRequestRequest.Type;
+
+export const MobileRejectAccessRequestResponse = Schema.Struct({
+  rejected: Schema.Boolean,
+});
+export type MobileRejectAccessRequestResponse = typeof MobileRejectAccessRequestResponse.Type;
+
+export const MobileAccessStatusResponse = Schema.Struct({
+  status: Schema.Literals(["pending", "approved", "rejected", "expired"]),
+  expiresAt: IsoDateTime,
+  session: Schema.optional(MobileTokenBundle),
+});
+export type MobileAccessStatusResponse = typeof MobileAccessStatusResponse.Type;
 
 export const MobileTokenRefreshRequest = Schema.Struct({
   refreshToken: TrimmedNonEmptyString,

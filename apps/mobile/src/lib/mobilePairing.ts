@@ -1,13 +1,5 @@
 import { getSecureItem, removeSecureItem, setSecureItem, STORAGE_KEYS } from "./storage";
 
-export type MobileConnectionMode = "auto" | "local" | "vpn";
-export type MobileConnectionTarget = "local" | "vpn";
-
-export interface MobileConnectionCandidate {
-  readonly target: MobileConnectionTarget;
-  readonly serverBaseUrl: string;
-}
-
 export interface MobileSessionBundle {
   readonly deviceId: string;
   readonly deviceName: string;
@@ -17,14 +9,36 @@ export interface MobileSessionBundle {
 }
 
 export interface MobileSettings {
-  readonly connectionMode: MobileConnectionMode;
-  readonly localServerBaseUrl: string;
-  readonly vpnServerBaseUrl: string;
+  readonly serverBaseUrl: string;
   readonly deviceName: string;
 }
 
-const DEFAULT_LOCAL_URL = "http://127.0.0.1:3773";
-const DEFAULT_VPN_URL = "http://your-host.ts.net:3773";
+export interface MobileAccessRequestState {
+  readonly requestId: string;
+  readonly status: "pending" | "approved" | "rejected" | "expired";
+  readonly expiresAt: string;
+  readonly createdAt?: string;
+  readonly session?: MobileSessionBundle;
+}
+
+const DEFAULT_SERVER_URL = "http://127.0.0.1:3773";
+
+function toNetworkError(serverBaseUrl: string, err: unknown): Error {
+  const error = new Error(
+    `Cannot connect to ${serverBaseUrl} - check that the server is running and this address is reachable from iOS`,
+  );
+  (error as Error & { cause?: unknown }).cause = err;
+  return error;
+}
+
+function normalizeServerBaseUrl(value: string | null | undefined): string {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return DEFAULT_SERVER_URL;
+  }
+
+  return trimmed.replace(/\/+$/, "");
+}
 
 /**
  * Loads saved mobile session bundle from secure storage.
@@ -57,17 +71,15 @@ export async function clearSession(): Promise<void> {
  * Loads mobile app settings from secure storage.
  */
 export async function loadSettings(): Promise<MobileSettings> {
-  const [mode, localUrl, vpnUrl, deviceName] = await Promise.all([
-    getSecureItem(STORAGE_KEYS.CONNECTION_MODE),
-    getSecureItem(STORAGE_KEYS.LOCAL_URL),
-    getSecureItem(STORAGE_KEYS.VPN_URL),
+  const [serverUrl, legacyLocalUrl, legacyVpnUrl, deviceName] = await Promise.all([
+    getSecureItem(STORAGE_KEYS.SERVER_URL),
+    getSecureItem(STORAGE_KEYS.LEGACY_LOCAL_URL),
+    getSecureItem(STORAGE_KEYS.LEGACY_VPN_URL),
     getSecureItem(STORAGE_KEYS.DEVICE_NAME),
   ]);
 
   return {
-    connectionMode: (mode as MobileConnectionMode) || "auto",
-    localServerBaseUrl: localUrl || DEFAULT_LOCAL_URL,
-    vpnServerBaseUrl: vpnUrl || DEFAULT_VPN_URL,
+    serverBaseUrl: normalizeServerBaseUrl(serverUrl ?? legacyLocalUrl ?? legacyVpnUrl),
     deviceName: deviceName || "Mobile Device",
   };
 }
@@ -77,103 +89,93 @@ export async function loadSettings(): Promise<MobileSettings> {
  */
 export async function saveSettings(settings: MobileSettings): Promise<void> {
   await Promise.all([
-    setSecureItem(STORAGE_KEYS.CONNECTION_MODE, settings.connectionMode),
-    setSecureItem(STORAGE_KEYS.LOCAL_URL, settings.localServerBaseUrl),
-    setSecureItem(STORAGE_KEYS.VPN_URL, settings.vpnServerBaseUrl),
+    setSecureItem(STORAGE_KEYS.SERVER_URL, normalizeServerBaseUrl(settings.serverBaseUrl)),
     setSecureItem(STORAGE_KEYS.DEVICE_NAME, settings.deviceName),
+    removeSecureItem(STORAGE_KEYS.LEGACY_LOCAL_URL),
+    removeSecureItem(STORAGE_KEYS.LEGACY_VPN_URL),
   ]);
-}
-
-/**
- * Resolves connection candidates based on mode and saved URLs.
- */
-export function resolveConnectionCandidates(
-  mode: MobileConnectionMode,
-  localUrl: string,
-  vpnUrl: string,
-  lastKnownTarget: MobileConnectionTarget | null,
-): MobileConnectionCandidate[] {
-  const candidates: MobileConnectionCandidate[] = [];
-
-  if (lastKnownTarget === "vpn" && vpnUrl) {
-    candidates.push({ target: "vpn", serverBaseUrl: vpnUrl });
-  }
-
-  if (mode === "auto" || mode === "vpn") {
-    if (vpnUrl) {
-      candidates.push({ target: "vpn", serverBaseUrl: vpnUrl });
-    }
-  }
-
-  if (mode === "auto" || mode === "local") {
-    if (localUrl) {
-      candidates.push({ target: "local", serverBaseUrl: localUrl });
-    }
-  }
-
-  return candidates;
 }
 
 /**
  * Builds WebSocket URL from base URL and token.
  */
 export function buildWebSocketUrl(baseUrl: string, token: string): string {
-  const wsProtocol = baseUrl.startsWith("https") ? "wss" : "ws";
-  const cleanBase = baseUrl.replace(/^https?:\/\//, "").replace(/^http?:\/\//, "");
+  const normalizedBaseUrl = normalizeServerBaseUrl(baseUrl);
+  const wsProtocol = normalizedBaseUrl.startsWith("https") ? "wss" : "ws";
+  const cleanBase = normalizedBaseUrl.replace(/^https?:\/\//, "");
   return `${wsProtocol}://${cleanBase}/ws?token=${encodeURIComponent(token)}`;
 }
 
 /**
- * Exchanges a pairing code for session credentials.
+ * Creates a pending access request on the selected server.
  */
-export async function exchangePairingCode(
+export async function requestAccess(
   serverBaseUrl: string,
   deviceName: string,
-  pairingCode: string,
-): Promise<MobileSessionBundle> {
-  const url = `${serverBaseUrl}/api/mobile/pairing/exchange`;
-  console.log(`[API] POST ${url}`);
-  console.log("[API] Body:", { deviceName, pairingCode: pairingCode.slice(0, 4) + "..." });
+): Promise<MobileAccessRequestState> {
+  const normalizedServerBaseUrl = normalizeServerBaseUrl(serverBaseUrl);
+  const url = `${normalizedServerBaseUrl}/api/mobile/access/request`;
 
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceName, pairingCode }),
+      body: JSON.stringify({ deviceName }),
     });
-
-    console.log("[API] Response status:", response.status);
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.error("[API] Error response:", errorText);
       let errorMessage = `HTTP ${response.status}`;
       try {
         const errorJson = JSON.parse(errorText);
-        errorMessage = errorJson.message || errorMessage;
+        errorMessage = errorJson.message || errorJson.error || errorMessage;
       } catch {
         if (errorText) errorMessage += `: ${errorText}`;
       }
       throw new Error(errorMessage);
     }
 
-    const data = await response.json();
-    console.log("[API] Success! Got session bundle");
-    return data;
+    return response.json();
   } catch (err) {
-    if (err instanceof TypeError && err.message.includes("fetch")) {
-      console.error(`[API] Network error - cannot connect to ${serverBaseUrl}`);
-      console.error("[API] Make sure:");
-      console.error("  1. Server is running");
-      console.error("  2. Using correct IP (not localhost/127.0.0.1 in simulator)");
-      console.error("  3. Server allows connections from your device IP");
-      throw new Error(
-        `Cannot connect to ${serverBaseUrl} - check server is running and URL is correct`,
-      );
+    if (err instanceof TypeError) {
+      throw toNetworkError(normalizedServerBaseUrl, err);
     }
-    console.error("[API] Fetch error:", err);
     throw err;
   }
+}
+
+/**
+ * Loads the current access request status from the server.
+ */
+export async function getAccessRequest(
+  serverBaseUrl: string,
+  requestId: string,
+): Promise<MobileAccessRequestState> {
+  const normalizedServerBaseUrl = normalizeServerBaseUrl(serverBaseUrl);
+  const url = `${normalizedServerBaseUrl}/api/mobile/access/status`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requestId }),
+    });
+  } catch (err) {
+    if (err instanceof TypeError) {
+      throw toNetworkError(normalizedServerBaseUrl, err);
+    }
+    throw err;
+  }
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `Unable to load access request status (HTTP ${response.status})${errorText ? `: ${errorText}` : ""}`,
+    );
+  }
+
+  return response.json();
 }
 
 /**
@@ -183,45 +185,27 @@ export async function refreshSessionToken(
   serverBaseUrl: string,
   refreshToken: string,
 ): Promise<MobileSessionBundle> {
-  const response = await fetch(`${serverBaseUrl}/api/mobile/token/refresh`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refreshToken }),
-  });
+  const normalizedServerBaseUrl = normalizeServerBaseUrl(serverBaseUrl);
+  const url = `${normalizedServerBaseUrl}/api/mobile/token/refresh`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refreshToken }),
+    });
+  } catch (err) {
+    if (err instanceof TypeError) {
+      throw toNetworkError(normalizedServerBaseUrl, err);
+    }
+    throw err;
+  }
 
   if (!response.ok) {
-    throw new Error("Token refresh failed");
+    const errorText = await response.text();
+    throw new Error(`Token refresh failed${errorText ? `: ${errorText}` : ""}`);
   }
 
   return response.json();
-}
-
-/**
- * Describes connection target in user-friendly terms.
- */
-export function describeConnectionTarget(target: MobileConnectionTarget): string {
-  if (target === "vpn") return "VPN";
-  if (target === "local") return "Local";
-  return "Unknown";
-}
-
-/**
- * Attempts connection with fallback candidates.
- */
-export async function executeWithConnectionCandidates<T>(
-  candidates: MobileConnectionCandidate[],
-  operation: (candidate: MobileConnectionCandidate) => Promise<T>,
-): Promise<{ candidate: MobileConnectionCandidate; result: T }> {
-  const errors: string[] = [];
-
-  for (const candidate of candidates) {
-    try {
-      const result = await operation(candidate);
-      return { candidate, result };
-    } catch (error) {
-      errors.push(`${candidate.target}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  throw new Error(`All connection attempts failed: ${errors.join("; ")}`);
 }

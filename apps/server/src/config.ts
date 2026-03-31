@@ -37,6 +37,7 @@ export interface ServerConfigShape extends ServerDerivedPaths {
   readonly mode: RuntimeMode;
   readonly port: number;
   readonly host: string | undefined;
+  readonly publicHost: string | undefined;
   readonly cwd: string;
   readonly baseDir: string;
   readonly staticDir: string | undefined;
@@ -105,6 +106,7 @@ export class ServerConfig extends ServiceMap.Service<ServerConfig, ServerConfigS
           logWebSocketEvents: false,
           port: 0,
           host: undefined,
+          publicHost: undefined,
           authToken: undefined,
           staticDir: undefined,
           devUrl,

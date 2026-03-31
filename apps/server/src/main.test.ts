@@ -59,15 +59,14 @@ const testLayer = Layer.mergeAll(
   NodeServices.layer,
 );
 
-const runCli = (
-  args: ReadonlyArray<string>,
-  env: Record<string, string> = { T3CODE_NO_BROWSER: "true" },
-) => {
+const runCli = (args: ReadonlyArray<string>, env: Record<string, string> = {}) => {
   return Command.runWith(t3Cli, { version: "0.0.0-test" })(args).pipe(
     Effect.provide(
       ConfigProvider.layer(
         ConfigProvider.fromEnv({
           env: {
+            T3CODE_NO_BROWSER: "true",
+            ...(env.T3CODE_BOOTSTRAP_FD === undefined ? { T3CODE_HOME: "/tmp/t3-cli-tests" } : {}),
             ...env,
           },
         }),
@@ -107,6 +106,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4010);
       assert.equal(resolvedConfig?.host, "0.0.0.0");
+      assert.equal(resolvedConfig?.publicHost, undefined);
       assert.equal(resolvedConfig?.baseDir, "/tmp/t3-cli-home");
       assert.equal(resolvedConfig?.stateDir, "/tmp/t3-cli-home/dev");
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://127.0.0.1:5173/");
@@ -127,12 +127,22 @@ it.layer(testLayer)("server CLI command", (it) => {
     }),
   );
 
+  it.effect("supports --public-host for mobile discovery advertising", () =>
+    Effect.gen(function* () {
+      yield* runCli(["--public-host", "my-mac.ts.net"]);
+
+      assert.equal(start.mock.calls.length, 1);
+      assert.equal(resolvedConfig?.publicHost, "my-mac.ts.net");
+    }),
+  );
+
   it.effect("uses env fallbacks when flags are not provided", () =>
     Effect.gen(function* () {
       yield* runCli([], {
         T3CODE_MODE: "desktop",
         T3CODE_PORT: "4999",
         T3CODE_HOST: "100.88.10.4",
+        T3CODE_PUBLIC_HOST: "my-mac.ts.net",
         T3CODE_HOME: "/tmp/t3-env-home",
         VITE_DEV_SERVER_URL: "http://localhost:5173",
         T3CODE_NO_BROWSER: "true",
@@ -143,6 +153,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4999);
       assert.equal(resolvedConfig?.host, "100.88.10.4");
+      assert.equal(resolvedConfig?.publicHost, "my-mac.ts.net");
       assert.equal(resolvedConfig?.baseDir, "/tmp/t3-env-home");
       assert.equal(resolvedConfig?.stateDir, "/tmp/t3-env-home/dev");
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://localhost:5173/");
@@ -170,6 +181,7 @@ it.layer(testLayer)("server CLI command", (it) => {
         T3CODE_MODE: "web",
         T3CODE_BOOTSTRAP_FD: String(fd),
         T3CODE_AUTH_TOKEN: "env-token",
+        T3CODE_HOME: "/tmp/t3-cli-tests",
         T3CODE_NO_BROWSER: "true",
       });
 
@@ -185,6 +197,7 @@ it.layer(testLayer)("server CLI command", (it) => {
         mode: "desktop",
         port: 4888,
         host: "127.0.0.2",
+        publicHost: "macbook.tailnet.ts.net",
         t3Home: "/tmp/t3-bootstrap-home",
         devUrl: "http://127.0.0.1:5173",
         noBrowser: true,
@@ -201,6 +214,7 @@ it.layer(testLayer)("server CLI command", (it) => {
       assert.equal(resolvedConfig?.mode, "desktop");
       assert.equal(resolvedConfig?.port, 4888);
       assert.equal(resolvedConfig?.host, "127.0.0.2");
+      assert.equal(resolvedConfig?.publicHost, "macbook.tailnet.ts.net");
       assert.equal(resolvedConfig?.baseDir, "/tmp/t3-bootstrap-home");
       assert.equal(resolvedConfig?.stateDir, "/tmp/t3-bootstrap-home/dev");
       assert.equal(resolvedConfig?.devUrl?.toString(), "http://127.0.0.1:5173/");

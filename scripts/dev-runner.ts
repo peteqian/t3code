@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { homedir } from "node:os";
+import { homedir, networkInterfaces } from "node:os";
 
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -24,13 +24,31 @@ const MODE_ARGS = {
     "dev",
     "--ui=tui",
     "--filter=@t3tools/contracts",
+    "--filter=@t3tools/ui",
+    "--filter=@t3tools/web",
+    "--filter=t3",
+    "--parallel",
+  ],
+  "dev:lan": [
+    "run",
+    "dev",
+    "--ui=tui",
+    "--filter=@t3tools/contracts",
+    "--filter=@t3tools/ui",
     "--filter=@t3tools/web",
     "--filter=t3",
     "--parallel",
   ],
   "dev:server": ["run", "dev", "--filter=t3"],
   "dev:web": ["run", "dev", "--filter=@t3tools/web"],
-  "dev:desktop": ["run", "dev", "--filter=@t3tools/desktop", "--filter=@t3tools/web", "--parallel"],
+  "dev:desktop": [
+    "run",
+    "dev",
+    "--filter=@t3tools/desktop",
+    "--filter=@t3tools/ui",
+    "--filter=@t3tools/web",
+    "--parallel",
+  ],
 } as const satisfies Record<string, ReadonlyArray<string>>;
 
 type DevMode = keyof typeof MODE_ARGS;
@@ -125,8 +143,41 @@ interface CreateDevRunnerEnvInput {
   readonly autoBootstrapProjectFromCwd: boolean | undefined;
   readonly logWebSocketEvents: boolean | undefined;
   readonly host: string | undefined;
+  readonly publicHost: string | undefined;
   readonly port: number | undefined;
   readonly devUrl: URL | undefined;
+}
+
+const isWildcardHost = (host: string | undefined): boolean =>
+  host === "0.0.0.0" || host === "::" || host === "[::]";
+
+function findLanHost(): string | undefined {
+  const nets = networkInterfaces();
+
+  for (const entries of Object.values(nets)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal || entry.family !== "IPv4") {
+        continue;
+      }
+      return entry.address;
+    }
+  }
+
+  return undefined;
+}
+
+function resolveClientHost(host: string | undefined, publicHost: string | undefined): string {
+  const trimmedPublicHost = publicHost?.trim();
+  if (trimmedPublicHost) {
+    return trimmedPublicHost;
+  }
+
+  const trimmedHost = host?.trim();
+  if (trimmedHost && !isWildcardHost(trimmedHost)) {
+    return trimmedHost;
+  }
+
+  return findLanHost() ?? "localhost";
 }
 
 export function createDevRunnerEnv({
@@ -140,6 +191,7 @@ export function createDevRunnerEnv({
   autoBootstrapProjectFromCwd,
   logWebSocketEvents,
   host,
+  publicHost,
   port,
   devUrl,
 }: CreateDevRunnerEnvInput): Effect.Effect<NodeJS.ProcessEnv, never, Path.Path> {
@@ -148,18 +200,22 @@ export function createDevRunnerEnv({
     const webPort = BASE_WEB_PORT + webOffset;
     const resolvedBaseDir = yield* resolveBaseDir(t3Home);
     const isDesktopMode = mode === "dev:desktop";
+    const clientHost = isDesktopMode ? "localhost" : resolveClientHost(host, publicHost);
+    const viteHost = host?.trim() || "localhost";
 
     const output: NodeJS.ProcessEnv = {
       ...baseEnv,
       PORT: String(webPort),
       ELECTRON_RENDERER_PORT: String(webPort),
-      VITE_DEV_SERVER_URL: devUrl?.toString() ?? `http://localhost:${webPort}`,
+      VITE_DEV_SERVER_URL: devUrl?.toString() ?? `http://${clientHost}:${webPort}`,
       T3CODE_HOME: resolvedBaseDir,
     };
 
     if (!isDesktopMode) {
       output.T3CODE_PORT = String(serverPort);
-      output.VITE_WS_URL = `ws://localhost:${serverPort}`;
+      output.VITE_WS_URL = `ws://${clientHost}:${serverPort}`;
+      output.T3CODE_PUBLIC_HOST = clientHost;
+      output.T3CODE_VITE_HOST = viteHost;
     } else {
       delete output.T3CODE_PORT;
       delete output.VITE_WS_URL;
@@ -167,6 +223,8 @@ export function createDevRunnerEnv({
       delete output.T3CODE_MODE;
       delete output.T3CODE_NO_BROWSER;
       delete output.T3CODE_HOST;
+      delete output.T3CODE_PUBLIC_HOST;
+      delete output.T3CODE_VITE_HOST;
     }
 
     if (!isDesktopMode && host !== undefined) {
@@ -355,6 +413,7 @@ interface DevRunnerCliInput {
   readonly autoBootstrapProjectFromCwd: boolean | undefined;
   readonly logWebSocketEvents: boolean | undefined;
   readonly host: string | undefined;
+  readonly publicHost: string | undefined;
   readonly port: number | undefined;
   readonly devUrl: URL | undefined;
   readonly dryRun: boolean;
@@ -441,6 +500,7 @@ export function runDevRunnerWithInput(input: DevRunnerCliInput) {
         envOverrides.logWebSocketEvents,
       ),
       host: input.host,
+      publicHost: input.publicHost,
       port: input.port,
       devUrl: input.devUrl,
     });
@@ -526,6 +586,12 @@ const devRunnerCli = Command.make("dev-runner", {
   host: Flag.string("host").pipe(
     Flag.withDescription("Server host/interface override (forwards to T3CODE_HOST)."),
     Flag.withFallbackConfig(optionalStringConfig("T3CODE_HOST")),
+  ),
+  publicHost: Flag.string("public-host").pipe(
+    Flag.withDescription(
+      "Client-facing host/IP for LAN or VPN access (forwards to T3CODE_PUBLIC_HOST).",
+    ),
+    Flag.withFallbackConfig(optionalStringConfig("T3CODE_PUBLIC_HOST")),
   ),
   port: Flag.integer("port").pipe(
     Flag.withSchema(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 65535 }))),

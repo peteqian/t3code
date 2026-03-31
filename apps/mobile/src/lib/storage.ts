@@ -8,9 +8,9 @@ import { Preferences } from "@capacitor/preferences";
 const STORAGE_KEYS = {
   SESSION_BUNDLE: "t3:mobile:session",
   DEVICE_NAME: "t3:mobile:deviceName",
-  CONNECTION_MODE: "t3:mobile:connectionMode",
-  LOCAL_URL: "t3:mobile:localUrl",
-  VPN_URL: "t3:mobile:vpnUrl",
+  SERVER_URL: "t3:mobile:serverUrl",
+  LEGACY_LOCAL_URL: "t3:mobile:localUrl",
+  LEGACY_VPN_URL: "t3:mobile:vpnUrl",
 } as const;
 
 /**

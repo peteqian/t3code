@@ -259,7 +259,7 @@ describe("WsTransport", () => {
     const socket = getSocket();
     socket.open();
 
-    const requestPromise = transport.request("server.createMobilePairing", { ttlSeconds: 120 });
+    const requestPromise = transport.request("server.listMobileAccessRequests", {});
 
     socket.serverMessage(
       JSON.stringify({

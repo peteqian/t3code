@@ -38,7 +38,12 @@ import { KeybindingRule } from "./keybindings";
 import { ProjectSearchEntriesInput, ProjectWriteFileInput } from "./project";
 import { OpenInEditorInput } from "./editor";
 import { ServerConfigUpdatedPayload } from "./server";
-import { MobilePairingCreateRequest, MobileRevokeDeviceRequest } from "./mobileCompanion";
+import {
+  MobileApproveAccessRequestRequest,
+  MobileListAccessRequestsResponse,
+  MobileRejectAccessRequestRequest,
+  MobileRevokeDeviceRequest,
+} from "./mobileCompanion";
 import { ServerProviderUpdatedPayload } from "./server";
 import { ServerSettingsPatch } from "./settings";
 
@@ -80,7 +85,9 @@ export const WS_METHODS = {
   serverGetConfig: "server.getConfig",
   serverRefreshProviders: "server.refreshProviders",
   serverUpsertKeybinding: "server.upsertKeybinding",
-  serverCreateMobilePairing: "server.createMobilePairing",
+  serverListMobileAccessRequests: "server.listMobileAccessRequests",
+  serverApproveMobileAccessRequest: "server.approveMobileAccessRequest",
+  serverRejectMobileAccessRequest: "server.rejectMobileAccessRequest",
   serverListMobileDevices: "server.listMobileDevices",
   serverRevokeMobileDevice: "server.revokeMobileDevice",
   serverGetSettings: "server.getSettings",
@@ -95,6 +102,7 @@ export const WS_CHANNELS = {
   serverWelcome: "server.welcome",
   serverConfigUpdated: "server.configUpdated",
   serverMobilePresence: "server.mobilePresence",
+  serverMobileAccessRequests: "server.mobileAccessRequests",
   serverProvidersUpdated: "server.providersUpdated",
 } as const;
 
@@ -153,7 +161,9 @@ const WebSocketRequestBody = Schema.Union([
   tagRequestBody(WS_METHODS.serverGetConfig, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverRefreshProviders, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverUpsertKeybinding, KeybindingRule),
-  tagRequestBody(WS_METHODS.serverCreateMobilePairing, MobilePairingCreateRequest),
+  tagRequestBody(WS_METHODS.serverListMobileAccessRequests, Schema.Struct({})),
+  tagRequestBody(WS_METHODS.serverApproveMobileAccessRequest, MobileApproveAccessRequestRequest),
+  tagRequestBody(WS_METHODS.serverRejectMobileAccessRequest, MobileRejectAccessRequestRequest),
   tagRequestBody(WS_METHODS.serverListMobileDevices, Schema.Struct({})),
   tagRequestBody(WS_METHODS.serverRevokeMobileDevice, MobileRevokeDeviceRequest),
   tagRequestBody(WS_METHODS.serverGetSettings, Schema.Struct({})),
@@ -202,6 +212,7 @@ export interface WsPushPayloadByChannel {
   readonly [WS_CHANNELS.serverWelcome]: WsWelcomePayload;
   readonly [WS_CHANNELS.serverConfigUpdated]: typeof ServerConfigUpdatedPayload.Type;
   readonly [WS_CHANNELS.serverMobilePresence]: WsMobilePresencePayload;
+  readonly [WS_CHANNELS.serverMobileAccessRequests]: MobileListAccessRequestsResponse;
   readonly [WS_CHANNELS.serverProvidersUpdated]: typeof ServerProviderUpdatedPayload.Type;
   readonly [WS_CHANNELS.gitActionProgress]: typeof GitActionProgressEvent.Type;
   readonly [WS_CHANNELS.terminalEvent]: typeof TerminalEvent.Type;
@@ -227,6 +238,10 @@ export const WsPushServerMobilePresence = makeWsPushSchema(
   WS_CHANNELS.serverMobilePresence,
   WsMobilePresencePayload,
 );
+export const WsPushServerMobileAccessRequests = makeWsPushSchema(
+  WS_CHANNELS.serverMobileAccessRequests,
+  MobileListAccessRequestsResponse,
+);
 export const WsPushServerConfigUpdated = makeWsPushSchema(
   WS_CHANNELS.serverConfigUpdated,
   ServerConfigUpdatedPayload,
@@ -249,6 +264,7 @@ export const WsPushChannelSchema = Schema.Literals([
   WS_CHANNELS.gitActionProgress,
   WS_CHANNELS.serverWelcome,
   WS_CHANNELS.serverMobilePresence,
+  WS_CHANNELS.serverMobileAccessRequests,
   WS_CHANNELS.serverConfigUpdated,
   WS_CHANNELS.serverProvidersUpdated,
   WS_CHANNELS.terminalEvent,
@@ -259,6 +275,7 @@ export type WsPushChannelSchema = typeof WsPushChannelSchema.Type;
 export const WsPush = Schema.Union([
   WsPushServerWelcome,
   WsPushServerMobilePresence,
+  WsPushServerMobileAccessRequests,
   WsPushServerConfigUpdated,
   WsPushServerProvidersUpdated,
   WsPushGitActionProgress,

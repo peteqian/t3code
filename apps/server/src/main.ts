@@ -28,7 +28,9 @@ import { ServerLoggerLive } from "./serverLogger";
 import { AnalyticsServiceLayerLive } from "./telemetry/Layers/AnalyticsService";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService";
 import { readBootstrapEnvelope } from "./bootstrap";
+import { MobileDiscoveryLive } from "./mobile/Layers/MobileDiscovery";
 import { MobileSessionManagerLive } from "./mobile/Layers/MobileSessionManager";
+import { MobileDiscovery } from "./mobile/Services/MobileDiscovery";
 import { ServerSettingsLive } from "./serverSettings";
 
 export class StartupError extends Data.TaggedError("StartupError")<{
@@ -42,6 +44,7 @@ const BootstrapEnvelopeSchema = Schema.Struct({
   mode: Schema.optional(Schema.String),
   port: Schema.optional(PortSchema),
   host: Schema.optional(Schema.String),
+  publicHost: Schema.optional(Schema.String),
   t3Home: Schema.optional(Schema.String),
   devUrl: Schema.optional(Schema.URLFromString),
   noBrowser: Schema.optional(Schema.Boolean),
@@ -54,6 +57,7 @@ interface CliInput {
   readonly mode: Option.Option<RuntimeMode>;
   readonly port: Option.Option<number>;
   readonly host: Option.Option<string>;
+  readonly publicHost: Option.Option<string>;
   readonly t3Home: Option.Option<string>;
   readonly devUrl: Option.Option<URL>;
   readonly noBrowser: Option.Option<boolean>;
@@ -114,6 +118,10 @@ const CliEnvConfig = Config.all({
   ),
   port: Config.port("T3CODE_PORT").pipe(Config.option, Config.map(Option.getOrUndefined)),
   host: Config.string("T3CODE_HOST").pipe(Config.option, Config.map(Option.getOrUndefined)),
+  publicHost: Config.string("T3CODE_PUBLIC_HOST").pipe(
+    Config.option,
+    Config.map(Option.getOrUndefined),
+  ),
   t3Home: Config.string("T3CODE_HOME").pipe(Config.option, Config.map(Option.getOrUndefined)),
   devUrl: Config.url("VITE_DEV_SERVER_URL").pipe(Config.option, Config.map(Option.getOrUndefined)),
   noBrowser: Config.boolean("T3CODE_NO_BROWSER").pipe(
@@ -271,12 +279,23 @@ const ServerConfigLive = (input: CliInput) =>
         ),
         () => (mode === "desktop" ? "127.0.0.1" : undefined),
       );
+      const publicHost = Option.getOrElse(
+        resolveOptionPrecedence(
+          input.publicHost,
+          Option.fromUndefinedOr(env.publicHost),
+          Option.flatMap(bootstrapEnvelope, (bootstrap) =>
+            Option.fromUndefinedOr(bootstrap.publicHost),
+          ),
+        ),
+        () => undefined,
+      );
 
       const config: ServerConfigShape = {
         mode,
         port,
         cwd: cliConfig.cwd,
         host,
+        publicHost,
         baseDir,
         ...derivedPaths,
         staticDir,
@@ -300,6 +319,7 @@ const LayerLive = (input: CliInput) =>
     Layer.provideMerge(ServerLoggerLive),
     Layer.provideMerge(AnalyticsServiceLayerLive),
     Layer.provideMerge(MobileSessionManagerLive),
+    Layer.provideMerge(MobileDiscoveryLive),
     Layer.provideMerge(ServerSettingsLive),
     Layer.provideMerge(ServerConfigLive(input)),
   );
@@ -338,6 +358,7 @@ export const recordStartupHeartbeat = Effect.gen(function* () {
 const makeServerRuntimeProgram = (input: CliInput) =>
   Effect.gen(function* () {
     const { start, stopSignal } = yield* Server;
+    const mobileDiscovery = yield* MobileDiscovery;
     const openDeps = yield* Open;
 
     const config = yield* ServerConfig;
@@ -352,6 +373,7 @@ const makeServerRuntimeProgram = (input: CliInput) =>
     }
 
     yield* start;
+    yield* mobileDiscovery.start;
     yield* Effect.forkChild(recordStartupHeartbeat);
 
     const localUrl = `http://localhost:${config.port}`;
@@ -404,6 +426,12 @@ const hostFlag = Flag.string("host").pipe(
   Flag.withDescription("Host/interface to bind (for example 127.0.0.1, 0.0.0.0, or a Tailnet IP)."),
   Flag.optional,
 );
+const publicHostFlag = Flag.string("public-host").pipe(
+  Flag.withDescription(
+    "Client-facing host/IP advertised to mobile discovery clients (equivalent to T3CODE_PUBLIC_HOST).",
+  ),
+  Flag.optional,
+);
 const t3HomeFlag = Flag.string("home-dir").pipe(
   Flag.withDescription("Base directory for all T3 Code data (equivalent to T3CODE_HOME)."),
   Flag.optional,
@@ -445,6 +473,7 @@ export const t3Cli = Command.make("t3", {
   mode: modeFlag,
   port: portFlag,
   host: hostFlag,
+  publicHost: publicHostFlag,
   t3Home: t3HomeFlag,
   devUrl: devUrlFlag,
   noBrowser: noBrowserFlag,

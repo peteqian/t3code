@@ -588,6 +588,7 @@ describe("WebSocket Server", () => {
       mode: "web",
       port: 0,
       host: undefined,
+      publicHost: undefined,
       cwd: options.cwd ?? "/test/project",
       baseDir,
       ...derivedPaths,
@@ -2031,31 +2032,34 @@ describe("WebSocket Server", () => {
     );
   });
 
-  it("creates pairing codes only with desktop auth token when enabled", async () => {
+  it("creates mobile access requests only with desktop auth token when enabled", async () => {
     server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
-    const unauthorized = await postJson(port, "/api/mobile/pairing/create", {});
+    const unauthorized = await postJson(port, "/api/mobile/access/request", {
+      deviceName: "ios-simulator",
+    });
     expect(unauthorized.statusCode).toBe(401);
 
     const authorized = await postJson(
       port,
-      "/api/mobile/pairing/create",
-      { ttlSeconds: 120 },
+      "/api/mobile/access/request",
+      { deviceName: "ios-simulator", ttlSeconds: 120 },
       { bearerToken: "desktop-secret" },
     );
     expect(authorized.statusCode).toBe(200);
     const payload = JSON.parse(authorized.body) as {
-      pairingCode: string;
+      requestId: string;
+      status: string;
       expiresAt: string;
     };
-    expect(typeof payload.pairingCode).toBe("string");
-    expect(payload.pairingCode).toMatch(/^[A-HJ-NP-Z2-9]{8}$/);
+    expect(typeof payload.requestId).toBe("string");
+    expect(payload.status).toBe("pending");
     expect(typeof payload.expiresAt).toBe("string");
   });
 
-  it("creates pairing codes through authenticated websocket server method", async () => {
+  it("lists and handles mobile access requests through authenticated websocket server methods", async () => {
     server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
@@ -2063,16 +2067,36 @@ describe("WebSocket Server", () => {
     const [authorizedWs] = await connectAndAwaitWelcome(port, "desktop-secret");
     connections.push(authorizedWs);
 
-    const response = await sendRequest(authorizedWs, WS_METHODS.serverCreateMobilePairing, {
-      ttlSeconds: 120,
-    });
-    expect(response.error).toBeUndefined();
-    expect(response.result).toEqual(
-      expect.objectContaining({
-        pairingCode: expect.any(String),
-        expiresAt: expect.any(String),
-      }),
+    const createResponse = await postJson(
+      port,
+      "/api/mobile/access/request",
+      { deviceName: "ios-simulator" },
+      { bearerToken: "desktop-secret" },
     );
+    const createPayload = JSON.parse(createResponse.body) as { requestId: string };
+
+    const listed = await sendRequest(authorizedWs, WS_METHODS.serverListMobileAccessRequests, {});
+    expect(listed.error).toBeUndefined();
+    expect(listed.result).toEqual({
+      requests: [
+        expect.objectContaining({
+          requestId: createPayload.requestId,
+          deviceName: "ios-simulator",
+        }),
+      ],
+    });
+
+    const approved = await sendRequest(authorizedWs, WS_METHODS.serverApproveMobileAccessRequest, {
+      requestId: createPayload.requestId,
+    });
+    expect(approved.error).toBeUndefined();
+    expect(approved.result).toEqual({ approved: true });
+
+    const rejected = await sendRequest(authorizedWs, WS_METHODS.serverRejectMobileAccessRequest, {
+      requestId: createPayload.requestId,
+    });
+    expect(rejected.error).toBeUndefined();
+    expect(rejected.result).toEqual({ rejected: false });
   });
 
   it("lists and revokes paired mobile devices through websocket server methods", async () => {
@@ -2085,20 +2109,27 @@ describe("WebSocket Server", () => {
 
     const createResponse = await postJson(
       port,
-      "/api/mobile/pairing/create",
-      {},
+      "/api/mobile/access/request",
+      { deviceName: "ios-simulator" },
       { bearerToken: "desktop-secret" },
     );
-    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
+    const createPayload = JSON.parse(createResponse.body) as { requestId: string };
 
-    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
-      pairingCode: createPayload.pairingCode,
-      deviceName: "ios-simulator",
+    await sendRequest(desktopWs, WS_METHODS.serverApproveMobileAccessRequest, {
+      requestId: createPayload.requestId,
     });
-    const exchangePayload = JSON.parse(exchangeResponse.body) as {
-      deviceId: string;
-      accessToken: string;
+
+    const statusResponse = await postJson(port, "/api/mobile/access/status", {
+      requestId: createPayload.requestId,
+    });
+    const statusPayload = JSON.parse(statusResponse.body) as {
+      session: {
+        deviceId: string;
+        accessToken: string;
+      };
     };
+
+    const exchangePayload = statusPayload.session;
 
     const [mobileWs] = await connectAndAwaitWelcome(port, exchangePayload.accessToken);
     connections.push(mobileWs);
@@ -2138,52 +2169,73 @@ describe("WebSocket Server", () => {
     expect(listedAfter.result).toEqual({ devices: [] });
   });
 
-  it("exchanges pairing code for tokens and allows websocket auth", async () => {
+  it("approves access requests for tokens and allows websocket auth", async () => {
     server = await createTestServer({ cwd: "/test", authToken: "desktop-secret" });
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
+    const [desktopWs] = await connectAndAwaitWelcome(port, "desktop-secret");
+    connections.push(desktopWs);
+
     const createResponse = await postJson(
       port,
-      "/api/mobile/pairing/create",
-      {},
+      "/api/mobile/access/request",
+      { deviceName: "ios-simulator" },
       { bearerToken: "desktop-secret" },
     );
     expect(createResponse.statusCode).toBe(200);
-    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
+    const createPayload = JSON.parse(createResponse.body) as { requestId: string };
 
-    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
-      pairingCode: createPayload.pairingCode,
-      deviceName: "ios-simulator",
+    const pendingResponse = await postJson(port, "/api/mobile/access/status", {
+      requestId: createPayload.requestId,
     });
-    expect(exchangeResponse.statusCode).toBe(200);
-    const exchangePayload = JSON.parse(exchangeResponse.body) as {
-      accessToken: string;
-      refreshToken: string;
-      deviceId: string;
+    expect(pendingResponse.statusCode).toBe(200);
+    const pendingPayload = JSON.parse(pendingResponse.body) as { status: string };
+    expect(pendingPayload.status).toBe("pending");
+
+    const approved = await sendRequest(desktopWs, WS_METHODS.serverApproveMobileAccessRequest, {
+      requestId: createPayload.requestId,
+    });
+    expect(approved.error).toBeUndefined();
+
+    const statusResponse = await postJson(port, "/api/mobile/access/status", {
+      requestId: createPayload.requestId,
+    });
+    expect(statusResponse.statusCode).toBe(200);
+    const exchangePayload = JSON.parse(statusResponse.body) as {
+      status: string;
+      session: {
+        accessToken: string;
+        refreshToken: string;
+        deviceId: string;
+      };
     };
-    expect(typeof exchangePayload.deviceId).toBe("string");
-    expect(typeof exchangePayload.accessToken).toBe("string");
-    expect(typeof exchangePayload.refreshToken).toBe("string");
+    expect(exchangePayload.status).toBe("approved");
+    expect(typeof exchangePayload.session.deviceId).toBe("string");
+    expect(typeof exchangePayload.session.accessToken).toBe("string");
+    expect(typeof exchangePayload.session.refreshToken).toBe("string");
 
     const [mobileWs, mobileWelcome] = await connectAndAwaitWelcome(
       port,
-      exchangePayload.accessToken,
+      exchangePayload.session.accessToken,
     );
     connections.push(mobileWs);
     expect(mobileWelcome.data).toEqual(
       expect.objectContaining({
         connectionKind: "mobile",
-        connectionDeviceId: exchangePayload.deviceId,
+        connectionDeviceId: exchangePayload.session.deviceId,
         connectionDeviceName: "ios-simulator",
       }),
     );
 
-    const secondExchange = await postJson(port, "/api/mobile/pairing/exchange", {
-      pairingCode: createPayload.pairingCode,
-      deviceName: "ios-simulator",
-    });
-    expect(secondExchange.statusCode).toBe(401);
+    const secondApprove = await sendRequest(
+      desktopWs,
+      WS_METHODS.serverApproveMobileAccessRequest,
+      {
+        requestId: createPayload.requestId,
+      },
+    );
+    expect(secondApprove.error).toBeDefined();
   });
 
   it("publishes mobile presence updates when mobile clients connect", async () => {
@@ -2196,21 +2248,25 @@ describe("WebSocket Server", () => {
 
     const createResponse = await postJson(
       port,
-      "/api/mobile/pairing/create",
-      {},
+      "/api/mobile/access/request",
+      { deviceName: "ios-simulator" },
       { bearerToken: "desktop-secret" },
     );
-    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
-    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
-      pairingCode: createPayload.pairingCode,
-      deviceName: "ios-simulator",
+    const createPayload = JSON.parse(createResponse.body) as { requestId: string };
+    await sendRequest(desktopWs, WS_METHODS.serverApproveMobileAccessRequest, {
+      requestId: createPayload.requestId,
+    });
+    const exchangeResponse = await postJson(port, "/api/mobile/access/status", {
+      requestId: createPayload.requestId,
     });
     const exchangePayload = JSON.parse(exchangeResponse.body) as {
-      accessToken: string;
-      deviceId: string;
+      session: {
+        accessToken: string;
+        deviceId: string;
+      };
     };
 
-    const [mobileWs] = await connectAndAwaitWelcome(port, exchangePayload.accessToken);
+    const [mobileWs] = await connectAndAwaitWelcome(port, exchangePayload.session.accessToken);
     connections.push(mobileWs);
 
     const mobilePresence = await waitForPush(
@@ -2220,7 +2276,7 @@ describe("WebSocket Server", () => {
     );
     expect(mobilePresence.data).toEqual({
       mobileConnectionCount: 1,
-      deviceIds: [exchangePayload.deviceId],
+      deviceIds: [exchangePayload.session.deviceId],
       deviceNames: ["ios-simulator"],
     });
   });
@@ -2230,27 +2286,36 @@ describe("WebSocket Server", () => {
     const addr = server.address();
     const port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
-    const createResponse = await postJson(port, "/api/mobile/pairing/create", {});
-    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
-    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
-      pairingCode: createPayload.pairingCode,
+    const [desktopWs] = await connectAndAwaitWelcome(port);
+    connections.push(desktopWs);
+
+    const createResponse = await postJson(port, "/api/mobile/access/request", {
       deviceName: "ios-simulator",
     });
-    const exchangePayload = JSON.parse(exchangeResponse.body) as { refreshToken: string };
+    const createPayload = JSON.parse(createResponse.body) as { requestId: string };
+    await sendRequest(desktopWs, WS_METHODS.serverApproveMobileAccessRequest, {
+      requestId: createPayload.requestId,
+    });
+    const exchangeResponse = await postJson(port, "/api/mobile/access/status", {
+      requestId: createPayload.requestId,
+    });
+    const exchangePayload = JSON.parse(exchangeResponse.body) as {
+      session: { refreshToken: string };
+    };
 
     const firstRefresh = await postJson(port, "/api/mobile/token/refresh", {
-      refreshToken: exchangePayload.refreshToken,
+      refreshToken: exchangePayload.session.refreshToken,
     });
     expect(firstRefresh.statusCode).toBe(200);
     const firstRefreshPayload = JSON.parse(firstRefresh.body) as {
       refreshToken: string;
       accessToken: string;
     };
-    expect(firstRefreshPayload.refreshToken).not.toBe(exchangePayload.refreshToken);
+    expect(firstRefreshPayload.refreshToken).not.toBe(exchangePayload.session.refreshToken);
     expect(typeof firstRefreshPayload.accessToken).toBe("string");
 
     const staleRefresh = await postJson(port, "/api/mobile/token/refresh", {
-      refreshToken: exchangePayload.refreshToken,
+      refreshToken: exchangePayload.session.refreshToken,
     });
     expect(staleRefresh.statusCode).toBe(401);
   });
@@ -2262,13 +2327,22 @@ describe("WebSocket Server", () => {
     let addr = server.address();
     let port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
-    const createResponse = await postJson(port, "/api/mobile/pairing/create", {});
-    const createPayload = JSON.parse(createResponse.body) as { pairingCode: string };
-    const exchangeResponse = await postJson(port, "/api/mobile/pairing/exchange", {
-      pairingCode: createPayload.pairingCode,
+    let [desktopWs] = await connectAndAwaitWelcome(port);
+    connections.push(desktopWs);
+
+    const createResponse = await postJson(port, "/api/mobile/access/request", {
       deviceName: "ios-simulator",
     });
-    const exchangePayload = JSON.parse(exchangeResponse.body) as { refreshToken: string };
+    const createPayload = JSON.parse(createResponse.body) as { requestId: string };
+    await sendRequest(desktopWs, WS_METHODS.serverApproveMobileAccessRequest, {
+      requestId: createPayload.requestId,
+    });
+    const exchangeResponse = await postJson(port, "/api/mobile/access/status", {
+      requestId: createPayload.requestId,
+    });
+    const exchangePayload = JSON.parse(exchangeResponse.body) as {
+      session: { refreshToken: string };
+    };
 
     await closeTestServer();
     server = await createTestServer({ cwd: "/test", baseDir });
@@ -2276,7 +2350,7 @@ describe("WebSocket Server", () => {
     port = typeof addr === "object" && addr !== null ? addr.port : 0;
 
     const refreshResponse = await postJson(port, "/api/mobile/token/refresh", {
-      refreshToken: exchangePayload.refreshToken,
+      refreshToken: exchangePayload.session.refreshToken,
     });
     expect(refreshResponse.statusCode).toBe(200);
     const refreshPayload = JSON.parse(refreshResponse.body) as { accessToken: string };

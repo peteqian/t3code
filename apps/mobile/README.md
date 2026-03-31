@@ -40,18 +40,34 @@ CAP_LIVE_RELOAD_HOST=192.168.1.x bun run dev:mobile:ios
 
 ## Connecting to Server
 
+The intended direction is discovery-first:
+
+1. Mobile should find nearby T3 Code servers automatically
+2. Pair against the selected server
+3. Only use a manual server URL as an advanced fallback
+
+Until discovery lands, the advanced fallback is a single manual server URL.
+
 On mobile devices, `localhost` refers to the device itself, not your Mac.
 
-1. Open the app → Settings (gear icon) → Show advanced
-2. Set **Local URL** to:
-   - **iOS Simulator**: `http://192.168.x.x:3773` (your Mac's IP)
-   - **Android Emulator**: `http://10.0.2.2:3773`
-   - **Real device on WiFi**: `http://192.168.x.x:3773`
+For browser-based mobile testing against the repo dev server, prefer starting the stack with a real client-facing host:
+
+```bash
+bun run dev:lan -- --public-host=192.168.x.x
+```
+
+Use your Mac's LAN IP for `--public-host`, or a VPN hostname/IP if you're connecting over a VPN.
+
+Manual server URL examples:
+
+- iOS Simulator: `http://192.168.x.x:3773`
+- Android Emulator: `http://10.0.2.2:3773`
+- Real device on WiFi: `http://192.168.x.x:3773`
 
 Find your Mac's IP with: `ifconfig | grep "inet " | grep 192.168`
 
 ## Troubleshooting
 
-- **Cannot connect**: Ensure server is running (`bun run dev:server`) and you're using the correct IP (not `127.0.0.1` or `localhost`)
+- **Cannot connect**: Ensure server is running (`bun run dev:server`) and you're using the correct server URL (not `127.0.0.1` or `localhost` on a real device)
 - **Sync issues**: Run `npx cap sync ios` after any native plugin changes
 - **Clean rebuild**: `npx cap open ios` → Product → Clean Build Folder in Xcode

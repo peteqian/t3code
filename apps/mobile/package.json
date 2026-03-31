@@ -19,6 +19,7 @@
     "@capacitor/preferences": "8.0.1",
     "@capacitor/splash-screen": "8.0.1",
     "@t3tools/contracts": "workspace:*",
+    "@t3tools/ui": "workspace:*",
     "lucide-react": "^1.7.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"

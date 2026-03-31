@@ -1,8 +1,12 @@
 import type {
+  MobileAccessRequestCreateRequest,
+  MobileAccessRequestCreateResponse,
+  MobileAccessStatusRequest,
+  MobileAccessStatusResponse,
+  MobileApproveAccessRequestResponse,
+  MobileListAccessRequestsResponse,
   MobileListDevicesResponse,
-  MobilePairingCreateResponse,
-  MobilePairingExchangeRequest,
-  MobilePairingExchangeResponse,
+  MobileRejectAccessRequestResponse,
   MobileRevokeDeviceResponse,
   MobileTokenRefreshRequest,
   MobileTokenRefreshResponse,
@@ -18,12 +22,19 @@ export class MobileSessionError extends Schema.TaggedErrorClass<MobileSessionErr
 ) {}
 
 export interface MobileSessionManagerShape {
-  readonly createPairingSecret: (input?: {
-    readonly ttlSeconds?: number;
-  }) => Effect.Effect<MobilePairingCreateResponse>;
-  readonly exchangePairingSecret: (
-    input: MobilePairingExchangeRequest,
-  ) => Effect.Effect<MobilePairingExchangeResponse, MobileSessionError>;
+  readonly createAccessRequest: (
+    input: MobileAccessRequestCreateRequest,
+  ) => Effect.Effect<MobileAccessRequestCreateResponse>;
+  readonly getAccessRequestStatus: (
+    input: MobileAccessStatusRequest,
+  ) => Effect.Effect<MobileAccessStatusResponse>;
+  readonly listAccessRequests: () => Effect.Effect<MobileListAccessRequestsResponse>;
+  readonly approveAccessRequest: (
+    requestId: string,
+  ) => Effect.Effect<MobileApproveAccessRequestResponse, MobileSessionError>;
+  readonly rejectAccessRequest: (
+    requestId: string,
+  ) => Effect.Effect<MobileRejectAccessRequestResponse, MobileSessionError>;
   readonly refreshAccessToken: (
     input: MobileTokenRefreshRequest,
   ) => Effect.Effect<MobileTokenRefreshResponse, MobileSessionError>;
