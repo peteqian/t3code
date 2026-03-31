@@ -4,7 +4,17 @@ import os from "node:os";
 import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { Effect, Exit, Layer, PlatformError, PubSub, Scope, Stream } from "effect";
+import {
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  ManagedRuntime,
+  PlatformError,
+  PubSub,
+  Scope,
+  Stream,
+} from "effect";
 import { describe, expect, it, afterEach, vi } from "vitest";
 import { createServer } from "./wsServer";
 import WebSocket from "ws";
@@ -75,7 +85,7 @@ const defaultProviderStatuses: ReadonlyArray<ServerProvider> = [
     installed: true,
     version: "0.116.0",
     status: "ready",
-    authStatus: "authenticated",
+    auth: { status: "authenticated" },
     checkedAt: "2026-01-01T00:00:00.000Z",
     models: [],
   },
@@ -91,20 +101,19 @@ const defaultServerSettings = DEFAULT_SERVER_SETTINGS;
 
 class MockTerminalManager implements TerminalManagerShape {
   private readonly sessions = new Map<string, TerminalSessionSnapshot>();
-  private readonly listeners = new Set<(event: TerminalEvent) => void>();
+  private readonly eventPubSub = Effect.runSync(PubSub.unbounded<TerminalEvent>());
+  private activeSubscriptions = 0;
 
   private key(threadId: string, terminalId: string): string {
     return `${threadId}\u0000${terminalId}`;
   }
 
   emitEvent(event: TerminalEvent): void {
-    for (const listener of this.listeners) {
-      listener(event);
-    }
+    Effect.runSync(PubSub.publish(this.eventPubSub, event));
   }
 
   subscriptionCount(): number {
-    return this.listeners.size;
+    return this.activeSubscriptions;
   }
 
   readonly open: TerminalManagerShape["open"] = (input: TerminalOpenInput) =>
@@ -211,13 +220,15 @@ class MockTerminalManager implements TerminalManagerShape {
 
   readonly subscribe: TerminalManagerShape["subscribe"] = (listener) =>
     Effect.sync(() => {
-      this.listeners.add(listener);
+      this.activeSubscriptions += 1;
+      const fiber = Effect.runFork(
+        Stream.runForEach(Stream.fromPubSub(this.eventPubSub), (event) => listener(event)),
+      );
       return () => {
-        this.listeners.delete(listener);
+        this.activeSubscriptions -= 1;
+        Effect.runFork(Fiber.interrupt(fiber).pipe(Effect.ignore));
       };
     });
-
-  readonly dispose: TerminalManagerShape["dispose"] = Effect.void;
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +549,7 @@ function deriveServerPathsSync(baseDir: string, devUrl: URL | undefined) {
 describe("WebSocket Server", () => {
   let server: Http.Server | null = null;
   let serverScope: Scope.Closeable | null = null;
+  let disposeServerRuntime: (() => Promise<void>) | null = null;
   const connections: WebSocket[] = [];
   const tempDirs: string[] = [];
 
@@ -584,6 +596,12 @@ describe("WebSocket Server", () => {
       options.providerRegistry ?? defaultProviderRegistryService,
     );
     const openLayer = Layer.succeed(Open, options.open ?? defaultOpenService);
+    const nodeServicesLayer = NodeServices.layer;
+    const serverSettingsLayer = ServerSettingsService.layerTest(options.serverSettings);
+    const serverSettingsRuntimeLayer = serverSettingsLayer.pipe(
+      Layer.provideMerge(nodeServicesLayer),
+    );
+    const analyticsLayer = AnalyticsService.layerTest;
     const serverConfigLayer = Layer.succeed(ServerConfig, {
       mode: "web",
       port: 0,
@@ -600,6 +618,11 @@ describe("WebSocket Server", () => {
       logWebSocketEvents: options.logWebSocketEvents ?? Boolean(options.devUrl),
     } satisfies ServerConfigShape);
     const infrastructureLayer = providerLayer.pipe(Layer.provideMerge(persistenceLayer));
+    const providerRuntimeLayer = infrastructureLayer.pipe(
+      Layer.provideMerge(serverConfigLayer),
+      Layer.provideMerge(serverSettingsRuntimeLayer),
+      Layer.provideMerge(analyticsLayer),
+    );
     const runtimeOverrides = Layer.mergeAll(
       options.gitManager ? Layer.succeed(GitManager, options.gitManager) : Layer.empty,
       options.gitCore
@@ -612,8 +635,14 @@ describe("WebSocket Server", () => {
 
     const runtimeLayer = Layer.merge(
       Layer.merge(
-        makeServerRuntimeServicesLayer().pipe(Layer.provide(infrastructureLayer)),
-        infrastructureLayer,
+        makeServerRuntimeServicesLayer().pipe(
+          Layer.provideMerge(providerRuntimeLayer),
+          Layer.provideMerge(serverConfigLayer),
+          Layer.provideMerge(serverSettingsRuntimeLayer),
+          Layer.provideMerge(analyticsLayer),
+          Layer.provideMerge(nodeServicesLayer),
+        ),
+        Layer.mergeAll(providerRuntimeLayer, serverSettingsRuntimeLayer, analyticsLayer),
       ),
       runtimeOverrides,
     );
@@ -627,27 +656,31 @@ describe("WebSocket Server", () => {
       Layer.provideMerge(AnalyticsService.layerTest),
       Layer.provideMerge(NodeServices.layer),
     );
-    const runtimeServices = await Effect.runPromise(
-      Layer.build(dependenciesLayer).pipe(Scope.provide(scope)),
-    );
-
+    const runtime = ManagedRuntime.make(dependenciesLayer);
     try {
-      const runtime = await Effect.runPromise(
-        createServer().pipe(Effect.provide(runtimeServices), Scope.provide(scope)),
-      );
+      const httpServer = await runtime.runPromise(createServer().pipe(Scope.provide(scope)));
+      disposeServerRuntime = () => runtime.dispose();
       serverScope = scope;
-      return runtime;
+      return httpServer;
     } catch (error) {
+      await runtime.dispose();
       await Effect.runPromise(Scope.close(scope, Exit.void));
       throw error;
     }
   }
 
   async function closeTestServer() {
-    if (!serverScope) return;
+    if (!serverScope && !disposeServerRuntime) return;
     const scope = serverScope;
+    const disposeRuntime = disposeServerRuntime;
     serverScope = null;
-    await Effect.runPromise(Scope.close(scope, Exit.void));
+    disposeServerRuntime = null;
+    if (scope) {
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+    }
+    if (disposeRuntime) {
+      await disposeRuntime();
+    }
   }
 
   afterEach(async () => {
@@ -1321,6 +1354,32 @@ describe("WebSocket Server", () => {
     expect(response.error?.message).toContain("exceeds current turn count");
   });
 
+  it("rejects project.create when the workspace root does not exist", async () => {
+    server = await createTestServer({ cwd: "/test" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const [ws] = await connectAndAwaitWelcome(port);
+    connections.push(ws);
+
+    const missingWorkspaceRoot = path.join(makeTempDir("t3code-ws-project-missing-"), "missing");
+    const response = await sendRequest(ws, ORCHESTRATION_WS_METHODS.dispatchCommand, {
+      type: "project.create",
+      commandId: "cmd-ws-project-create-missing",
+      projectId: "project-missing",
+      title: "Missing Project",
+      workspaceRoot: missingWorkspaceRoot,
+      defaultModelSelection: {
+        provider: "codex",
+        model: "gpt-5-codex",
+      },
+      createdAt: new Date().toISOString(),
+    });
+
+    expect(response.result).toBeUndefined();
+    expect(response.error?.message).toContain("Workspace root does not exist:");
+  });
+
   it("keeps orchestration domain push behavior for provider runtime events", async () => {
     const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
     const emitRuntimeEvent = (event: ProviderRuntimeEvent) => {
@@ -1521,19 +1580,25 @@ describe("WebSocket Server", () => {
     expect(push.channel).toBe(WS_CHANNELS.terminalEvent);
   });
 
-  it("detaches terminal event listener on stop for injected manager", async () => {
+  it("shuts down cleanly for injected terminal managers", async () => {
     const terminalManager = new MockTerminalManager();
     server = await createTestServer({
       cwd: "/test",
       terminalManager,
     });
 
-    expect(terminalManager.subscriptionCount()).toBe(1);
-
     await closeTestServer();
     server = null;
 
-    expect(terminalManager.subscriptionCount()).toBe(0);
+    expect(() =>
+      terminalManager.emitEvent({
+        type: "output",
+        threadId: "thread-1",
+        terminalId: DEFAULT_TERMINAL_ID,
+        createdAt: new Date().toISOString(),
+        data: "after shutdown\n",
+      }),
+    ).not.toThrow();
   });
 
   it("returns validation errors for invalid terminal open params", async () => {
@@ -1725,6 +1790,50 @@ describe("WebSocket Server", () => {
     );
   });
 
+  it("invalidates workspace entry search cache after projects.writeFile", async () => {
+    const workspace = makeTempDir("t3code-ws-write-file-invalidate-");
+    fs.mkdirSync(path.join(workspace, "src"), { recursive: true });
+    fs.writeFileSync(path.join(workspace, "src", "existing.ts"), "export {};\n", "utf8");
+
+    server = await createTestServer({ cwd: "/test" });
+    const addr = server.address();
+    const port = typeof addr === "object" && addr !== null ? addr.port : 0;
+
+    const [ws] = await connectAndAwaitWelcome(port);
+    connections.push(ws);
+
+    const beforeWrite = await sendRequest(ws, WS_METHODS.projectsSearchEntries, {
+      cwd: workspace,
+      query: "rpc",
+      limit: 10,
+    });
+    expect(beforeWrite.error).toBeUndefined();
+    expect(beforeWrite.result).toEqual({
+      entries: [],
+      truncated: false,
+    });
+
+    const writeResponse = await sendRequest(ws, WS_METHODS.projectsWriteFile, {
+      cwd: workspace,
+      relativePath: "plans/effect-rpc.md",
+      contents: "# Plan\n",
+    });
+    expect(writeResponse.error).toBeUndefined();
+
+    const afterWrite = await sendRequest(ws, WS_METHODS.projectsSearchEntries, {
+      cwd: workspace,
+      query: "rpc",
+      limit: 10,
+    });
+    expect(afterWrite.error).toBeUndefined();
+    expect(afterWrite.result).toEqual({
+      entries: expect.arrayContaining([
+        expect.objectContaining({ path: "plans/effect-rpc.md", kind: "file" }),
+      ]),
+      truncated: false,
+    });
+  });
+
   it("rejects projects.writeFile paths outside the workspace root", async () => {
     const workspace = makeTempDir("t3code-ws-write-file-reject-");
 
@@ -1743,7 +1852,7 @@ describe("WebSocket Server", () => {
 
     expect(response.result).toBeUndefined();
     expect(response.error?.message).toContain(
-      "Workspace file path must stay within the project root.",
+      "Workspace file path must be relative to the project root: ../escape.md",
     );
     expect(fs.existsSync(path.join(workspace, "..", "escape.md"))).toBe(false);
   });
